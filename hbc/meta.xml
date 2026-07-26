@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<app version="1">
+
+    <name>mGBAGX</name>
+
+    <coder>
+daillou et al.
+    </coder>
+
+    <version>1.0.0</version>
+
+    <release_date>20260725</release_date>
+
+    <short_description>
+Game Boy Advance Emulator
+    </short_description>
+
+    <long_description>
+mGBAGX is a Wii frontend based on Visual Boy Advance GX utilizing the mGBA emulator core.
+
+Features:
+• High compatibility emulation via mGBA
+• Wii-friendly GX interface
+• SD, USB support
+• Save states and battery saves
+• Controller support including Wii Remote, Classic Controller and GameCube Controller
+
+Based on VBA GX by Tantric.
+Powered by mGBA by endrift and contributors.
+
+See LICENSE for complete licensing information.
+    </long_description>
+
+    <ahb_access />
+
+</app>
