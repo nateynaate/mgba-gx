@@ -1,0 +1,193 @@
+#---------------------------------------------------------------------------------
+# Clear the implicit built in rules
+#---------------------------------------------------------------------------------
+.SUFFIXES:
+#---------------------------------------------------------------------------------
+ifeq ($(strip $(DEVKITPPC)),)
+$(error "Please set DEVKITPPC in your environment. export DEVKITPPC=<path to>devkitPPC")
+endif
+
+include $(DEVKITPPC)/gamecube_rules
+export	FREETYPE_CFLAGS 	:=	`$(DEVKITPRO)/portlibs/ppc/bin/powerpc-eabi-pkg-config --cflags freetype2`
+export	FREETYPE_LIBS	:=	`$(DEVKITPRO)/portlibs/ppc/bin/powerpc-eabi-pkg-config --libs freetype2`
+
+#---------------------------------------------------------------------------------
+# TARGET is the name of the output
+# BUILD is the directory where object files & intermediate files will be placed
+# SOURCES is a list of directories containing source code
+# INCLUDES is a list of directories containing extra header files
+#---------------------------------------------------------------------------------
+TARGET		:=	vbagx-gc
+TARGETDIR   :=  executables
+BUILD		:=	build_gc
+SOURCES		:=	source source/gui source/utils source/utils/sz \
+				source/vba source/vba/apu source/vba/common \
+				source/vba/gb source/vba/gba source/goomba source/goomba/minilzo-2.06
+DATA		:=	source/images source/sounds source/fonts source/lang
+INCLUDES 	:=  source source/vba
+
+#---------------------------------------------------------------------------------
+# options for code generation
+#---------------------------------------------------------------------------------
+
+# -fno-strict-aliasing: critical for GCC 16 pointer casting inside Memory.cpp
+# -ffast-math: legacy speed boost for APU processing blocks
+CFLAGS		=	-g -O3 -Wall $(MACHDEP) $(INCLUDE) $(FREETYPE_CFLAGS) \
+				-DNO_SOUND -DUSE_VM -DWORDS_BIGENDIAN -DNO_LINK -DNO_FEX \
+				-DTILED_RENDERING \
+				-DC_CORE -D__ppc__ -D__POWERPC__ -DFINAL_VERSION \
+				-DSDL -DNO_PNG -DHAVE_ZUTIL_H \
+				-D_SZ_ONE_DIRECTORY -D_LZMA_IN_CB -D_LZMA_OUT_READ \
+				-flto=auto \
+				-fomit-frame-pointer -fno-strict-aliasing \
+				-Wno-unused-parameter -Wno-parentheses -Wno-format -Wno-stringop-truncation \
+				-Wno-maybe-uninitialized -Wno-unused-but-set-variable -Wno-stringop-overflow -Wno-narrowing \
+				-Wno-misleading-indentation -Wno-unused-function -Wno-sign-compare -Wno-unused-variable \
+				-Wno-memset-elt-size -Wno-attributes -Wno-tautological-compare -Wno-infinite-recursion -Wno-array-bounds
+
+# Strip C++ runtime bloating to conserve L1 I-Cache lines
+CXXFLAGS	=	$(CFLAGS) -fno-exceptions -fno-rtti -Wno-reorder -fno-threadsafe-statics
+
+# Added -O3 and LTO directly to linker pipeline for global scope analysis optimization
+LDFLAGS		=	-g -O3 -flto=auto $(MACHDEP) -Wl,-Map,$(notdir $@).map
+LDFLAGS		+=	-L../buildtools
+
+#---------------------------------------------------------------------------------
+# any extra libraries we wish to link with
+#---------------------------------------------------------------------------------
+LIBS	:=	-lpng -lmxml -ltinysmb -lbba -lfat -liso9660 -lz -logc $(FREETYPE_LIBS)
+
+#---------------------------------------------------------------------------------
+# list of directories containing libraries, this must be the top level containing
+# include and lib
+#---------------------------------------------------------------------------------
+LIBDIRS	:= $(PORTLIBS)
+
+#---------------------------------------------------------------------------------
+# no real need to edit anything past this point unless you need to add additional
+# rules for different file extensions
+#---------------------------------------------------------------------------------
+ifneq ($(BUILD),$(notdir $(CURDIR)))
+#---------------------------------------------------------------------------------
+
+export OUTPUT	:=	$(CURDIR)/$(TARGETDIR)/$(TARGET)
+
+export VPATH	:=	$(foreach dir,$(SOURCES),$(CURDIR)/$(dir)) \
+					$(foreach dir,$(DATA),$(CURDIR)/$(dir))
+
+export DEPSDIR	:=	$(CURDIR)/$(BUILD)
+
+#---------------------------------------------------------------------------------
+# automatically build a list of object files for our project
+#---------------------------------------------------------------------------------
+CFILES		:=	$(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.c)))
+CPPFILES	:=	$(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.cpp)))
+sFILES		:=	$(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.s)))
+SFILES		:=	$(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.S)))
+BINFILES	:=	$(foreach dir,$(DATA),$(notdir $(wildcard $(dir)/*.ttf) \
+					$(wildcard $(dir)/*.lang) $(wildcard $(dir)/*.png) \
+					$(wildcard $(dir)/*.pcm)))
+
+#---------------------------------------------------------------------------------
+# use CXX for linking C++ projects, CC for standard C
+#---------------------------------------------------------------------------------
+ifeq ($(strip $(CPPFILES)),)
+	export LD	:=	$(CC)
+else
+	export LD	:=	$(CXX)
+endif
+
+export OFILES_BIN	:=	$(addsuffix .o,$(BINFILES))
+
+# ISOLATION: Filter out GBA-arm.o and GBA-thumb.o from the automatic optimization rule
+export OFILES_SOURCES := $(filter-out GBA-arm.o GBA-thumb.o, $(CPPFILES:.cpp=.o)) $(CFILES:.c=.o) $(sFILES:.s=.o) $(SFILES:.S=.o)
+export OFILES := $(OFILES_BIN) $(OFILES_SOURCES) $(BUILD)/GBA-arm.o $(BUILD)/GBA-thumb.o
+
+export HFILES := $(addsuffix .h,$(subst .,_,$(BINFILES)))
+
+#---------------------------------------------------------------------------------
+# build a list of include paths (-iquote helps speed up header namespaces maps)
+#---------------------------------------------------------------------------------
+export INCLUDE	:=	$(foreach dir,$(INCLUDES),-iquote $(CURDIR)/$(dir)) \
+					$(foreach dir,$(LIBDIRS),-I$(dir)/include) \
+					-I$(CURDIR)/$(BUILD) \
+					-I$(LIBOGC_INC)
+
+#---------------------------------------------------------------------------------
+# build a list of library paths
+#---------------------------------------------------------------------------------
+export LIBPATHS	:= -L$(LIBOGC_LIB) $(foreach dir,$(LIBDIRS),-L$(dir)/lib)
+
+export OUTPUT	:=	$(CURDIR)/$(TARGETDIR)/$(TARGET)
+.PHONY: $(BUILD) clean
+
+#---------------------------------------------------------------------------------
+$(BUILD):
+	@[ -d $@ ] || mkdir -p $@
+	@[ -d $(TARGETDIR) ] || mkdir -p $(TARGETDIR)
+	@make --no-print-directory -C $(BUILD) -f $(CURDIR)/Makefile.gc
+
+#---------------------------------------------------------------------------------
+clean:
+	@echo clean ...
+	@rm -fr $(BUILD) $(OUTPUT).elf $(OUTPUT).dol
+
+#---------------------------------------------------------------------------------
+run:
+	psoload $(OUTPUT).dol
+
+#---------------------------------------------------------------------------------
+reload:
+	psoload -r $(OUTPUT).dol
+
+#---------------------------------------------------------------------------------
+else
+
+DEPENDS	:=	$(OFILES:.o=.d)
+
+#---------------------------------------------------------------------------------
+# main targets
+#---------------------------------------------------------------------------------
+$(OUTPUT).dol: $(OUTPUT).elf
+$(OUTPUT).elf: $(OFILES)
+
+$(OFILES_SOURCES) : $(HFILES)
+
+#---------------------------------------------------------------------------------
+# This rule links in binary data with these extensions: ttf lang png pcm
+#---------------------------------------------------------------------------------
+%.ttf.o %_ttf.h : %.ttf
+	@echo $(notdir $<)
+	$(bin2o)
+	
+%.lang.o %_lang.h : %.lang
+	@echo $(notdir $<)
+	$(bin2o)
+
+%.png.o %_png.h : %.png
+	@echo $(notdir $<)
+	$(bin2o)
+
+%.pcm.o %_pcm.h : %.pcm
+	@echo $(notdir $<)
+	$(bin2o)
+
+-include $(DEPENDS)
+
+#---------------------------------------------------------------------------------
+# Optimized rules for GBA-arm.cpp and GBA-thumb.cpp to prevent I-Cache thrashing
+# Forces -O2 and restricts code-bloating unrolls inside large switch blocks
+#---------------------------------------------------------------------------------
+$(BUILD)/GBA-arm.o: GBA-arm.cpp
+	@mkdir -p $(dir $@)
+	@echo "Compiling GBA-arm.o with I-Cache optimized flags..."
+	$(CXX) -c -O2 -fno-unroll-loops $(CXXFLAGS) $< -o $@
+
+$(BUILD)/GBA-thumb.o: GBA-thumb.cpp
+	@mkdir -p $(dir $@)
+	@echo "Compiling GBA-thumb.o with I-Cache optimized flags..."
+	$(CXX) -c -O2 -fno-unroll-loops $(CXXFLAGS) $< -o $@
+
+#---------------------------------------------------------------------------------
+endif
+#---------------------------------------------------------------------------------

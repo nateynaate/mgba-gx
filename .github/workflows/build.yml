@@ -1,0 +1,102 @@
+name: VBA GX Build
+
+on: [push, pull_request]
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        image: ["Wii", "GameCube"]
+    container: ghcr.io/extremscorner/libogc2:latest
+
+    steps:
+    - name: Checkout vbagx repo
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Build Wii
+      if: ${{ matrix.image == 'Wii' }}
+      run: |
+        make -f Makefile.wii -j1
+
+    - name: Copy Wii artifacts
+      if: ${{ matrix.image == 'Wii' }}
+      run: |
+        mkdir -p dist/VisualBoyAdvanceGX/apps/vbagx
+        mkdir -p dist/VisualBoyAdvanceGX/vbagx/roms
+        mkdir dist/VisualBoyAdvanceGX/vbagx/saves
+        touch dist/VisualBoyAdvanceGX/vbagx/roms/romsdir
+        touch dist/VisualBoyAdvanceGX/vbagx/saves/savesdir
+        cp hbc/* dist/VisualBoyAdvanceGX/apps/vbagx/
+        cp executables/vbagx-wii.dol dist/VisualBoyAdvanceGX/apps/vbagx/boot.dol
+
+    - name: Upload Wii artifacts
+      uses: actions/upload-artifact@v4
+      if: ${{ matrix.image == 'Wii' }}
+      with:
+        name: VisualBoyAdvanceGX
+        path: |
+          dist/VisualBoyAdvanceGX/
+
+    - name: Build GameCube
+      if: ${{ matrix.image == 'GameCube' }}
+      run: |
+        make -f Makefile.gc -j1
+
+    - name: Copy GameCube artifact
+      if: ${{ matrix.image == 'GameCube' }}
+      run: |
+        mkdir -p dist/VisualBoyAdvanceGX-GameCube
+        cp executables/vbagx-gc.dol dist/VisualBoyAdvanceGX-GameCube/
+
+    - name: Upload GameCube artifact
+      uses: actions/upload-artifact@v4
+      if: ${{ matrix.image == 'GameCube' }}
+      with:
+        name: VisualBoyAdvanceGX-GameCube
+        path: |
+          dist/VisualBoyAdvanceGX-GameCube/
+
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    needs: [build]
+    if: github.ref == 'refs/heads/master'
+
+    steps:
+    - name: Checkout vbagx repo
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Download Artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: dist
+
+    - name: Re-zip artifacts
+      run: |
+        cd dist/VisualBoyAdvanceGX
+        rm -r vbagx/roms/*
+        rm -r vbagx/saves/*
+        zip -r ../VisualBoyAdvanceGX.zip *
+        cd ../VisualBoyAdvanceGX-GameCube
+        zip -r ../VisualBoyAdvanceGX-GameCube.zip *
+
+    - name: Update Git Tag
+      run: |
+        git tag -f Pre-release
+        git push -f origin Pre-release
+
+    - name: Create Release
+      uses: ncipollo/release-action@v1
+      with:
+        prerelease: true
+        allowUpdates: true
+        removeArtifacts: true
+        replacesArtifacts: false
+        tag: Pre-release
+        artifacts: "dist/*.zip"
