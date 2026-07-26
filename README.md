@@ -25,7 +25,6 @@ place of the original VBA-M backend.
 - IPS/UPS/BPS patch support - drop a patch file next to a ROM with a
   matching filename and it's applied automatically at load time
 - Save states and SRAM saves
-- Boktai solar sensor support
 
 ## Building
 

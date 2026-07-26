@@ -18,33 +18,6 @@ Tantric), which is GPLv2 as well.
 The actual emulator core is mGBA (https://github.com/mgba-emu/mgba),
 licensed under the Mozilla Public License 2.0 - full text below.
 
-## Why combining them is OK
-
-MPL-2.0 is explicitly compatible with GPLv2 (it lists GPLv2 as a
-"Secondary License" in the license text itself). The practical
-effect: mGBA's own source files stay under MPL-2.0, and the combined
-binary you distribute is licensed as GPLv2 overall.
-
-## What NOT to do (the actual violation risks)
-
-- Don't strip the MPL-2.0 header comment from any mGBA source file
-  you vendor into this repo (the "This Source Code Form is subject
-  to the terms of the Mozilla Public License..." block at the top).
-  Leave it as-is, even in files you've modified.
-- Don't strip the existing copyright headers from vbagx-derived
-  files either (e.g. the "Tantric 2008-2023 / softdev 2007" header
-  in video.h). Add your own line noting your changes underneath it -
-  don't replace it.
-- If you vendor mGBA's source directly into this repo (rather than
-  pulling it as a submodule/prebuilt library), keep mGBA's own
-  LICENSE file alongside it, unmodified.
-- Because this is GPL, anyone you give a compiled build to is also
-  entitled to the corresponding source - having it public on GitHub
-  already satisfies that.
-- Keep crediting the original authors (Tantric, softdev, emu_kidid,
-  the VBA-M team, Jeffrey Pfau/mGBA) in your README's credits
-  section, same as upstream vbagx already does.
-
 ----------------------------------------------------------------------
 
 ## GNU General Public License, version 2
