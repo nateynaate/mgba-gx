@@ -18,7 +18,7 @@
 #include "utils/FreeTypeGX.h"
 
 #define APPNAME 		"mGBA-GX"
-#define APPVERSION 		"1.0.0"
+#define APPVERSION 		"1.0.1"
 #define APPFOLDER 		"mgbagx"
 #define PREF_FILE_NAME 	"settings.xml"
 
