@@ -22,6 +22,7 @@
 #include <ogc/audio.h>
 #include <ogc/cache.h>
 #include <ogc/system.h>
+#include <ogc/lwp_watchdog.h>
 #include <asndlib.h>
 
 #include <mgba/core/core.h>
@@ -32,6 +33,7 @@
 #include <mgba-util/patch.h>
 #include <mgba-util/audio-buffer.h>
 #include <mgba-util/audio-resampler.h>
+#include <mgba-util/configuration.h>
 #include <mgba/internal/gba/gba.h>
 // GB palette is written via DMG I/O registers using core->rawWrite8:
 //   0xFF47 = BGP  (background palette)
@@ -78,6 +80,153 @@ char  PatchFilename[MAXPATHLEN] = {0};
 
 /* mGBA state */
 static struct mCore *core             = NULL;
+
+/* -------------------------------------------------------------------------
+ * Save-type detection
+ *
+ * mGBA's own built-in override table (src/gba/overrides.c, wired up via
+ * mCoreLoadConfig() below) forces the correct save type for a handful of
+ * well-known problem carts - Pokemon Ruby/Sapphire/Emerald among them -
+ * because runtime heuristics alone (guessing from which memory region the
+ * game's first save-related access touches) can settle on the wrong
+ * type and then SILENTLY RESIZE the existing save file to match once
+ * gameplay starts. Real, destructive data loss - not just a "fails to
+ * load" cosmetic issue.
+ *
+ * Rather than only patching in per-game entries by hand as each broken
+ * cart is discovered, DetectSaveTypeFromROM() below scans the ROM's own
+ * bytes for the save-library ID strings the GBA SDK's linker embeds
+ * verbatim into any cart that uses it - "EEPROM_V", "SRAM_V", "SRAM_F_V",
+ * "FLASH_V", "FLASH512_V", "FLASH1M_V" (each followed by a 3-digit
+ * version number, e.g. "FLASH1M_V102"). This is the same technique
+ * VBA/VBA-M and other GBA emulators use as their PRIMARY save-type
+ * detection: since the string is part of the actual save-driver code the
+ * game was linked against, it's a fact about the cart, not a probabilistic
+ * guess from observed behavior - and it correctly disambiguates
+ * Flash64k vs Flash128k (FLASH_V vs FLASH1M_V are distinct strings) up
+ * front, before any gameplay has happened.
+ *
+ * This does NOT replace mGBA's own built-in override table - that one
+ * still applies via mCoreLoadConfig() for carts it already knows about.
+ * It supplements it: any cart with a recognizable ID string gets a
+ * correct, general answer without ever being individually special-cased.
+ *
+ * Carts that hit neither mGBA's table nor a recognizable string (usually
+ * because their code was hand-optimized or built without linking the
+ * stock SDK save library, so no ID string survives in the binary) fall
+ * through to knownSaveTypeOverrides[] below, same as before - but that
+ * table now only needs to hold the rare, CONFIRMED-via-hardware-dump
+ * exceptions, not every cart in general.
+ *
+ * Both paths write into the SAME Configuration table that mCoreLoadConfig()
+ * below already populates from any on-disk config.ini, mirroring mGBA's
+ * own per-game config.ini override mechanism (GBAOverrideFind(),
+ * src/gba/overrides.c): a section named "override.<4-char game code>"
+ * with a "savetype" key. Writing directly into that table's
+ * "override.XXXX" section here has the exact same effect as if the user
+ * had hand-edited a config.ini with:
+ *     [override.B24E]
+ *     savetype=FLASH1M
+ * but doesn't depend on this Wii port actually having a writable/loaded
+ * config.ini at a well-known path (mCoreInitConfig(core, NULL) above is
+ * given a NULL port name, so there's no guarantee one exists here).
+ *
+ * IMPORTANT: struct mCoreConfig's fields (configTable, port, etc.) are
+ * used directly elsewhere in this file only via the mCoreConfigSet*()
+ * wrapper functions - this is the first place touching config.configTable
+ * directly. If your local mgba/core/config.h doesn't expose configTable
+ * as a plain (non-opaque) struct member, this won't compile - the fix in
+ * that case is to instead write an actual config.ini file to whatever
+ * path mCoreInitConfig(core, NULL) reads from, with the same
+ * [override.XXXX] section shown above.
+ *
+ * Only add entries to knownSaveTypeOverrides[] that are CONFIRMED via a
+ * hardware save-type dump (e.g. gbhwdb.gekkio.fi) - guessing wrong there
+ * reintroduces the exact "silently resizes/corrupts your save" failure
+ * mode this is meant to fix.
+ */
+struct SaveTypeOverrideEntry {
+    char gameCode[5];   // 4 chars + NUL, matches GBA header offset 0xAC
+    const char *saveType; // one of: SRAM, FLASH512, FLASH1M, EEPROM, EEPROM512, NONE
+};
+
+static const struct SaveTypeOverrideEntry knownSaveTypeOverrides[] = {
+    // Pokemon Mystery Dungeon: Red Rescue Team (US/AU) - confirmed 1M FLASH
+    // via hardware dump; NOT in mGBA's built-in overrides.c table. Its
+    // binary also doesn't carry a scannable FLASH1M_V string (hand-tuned
+    // save code, no stock SDK library linked in), so DetectSaveTypeFromROM()
+    // can't find it either - this entry is the fallback for exactly that
+    // "no string, no built-in override" gap.
+    { "B24E", "FLASH1M" },
+};
+
+/* Scans romBuffer for a GBA SDK save-library ID string and returns the
+ * matching mGBA savetype config value, or NULL if none was found. Order
+ * matters: FLASH512_V/FLASH1M_V must be checked before the bare FLASH_V,
+ * since some libraries additionally emit a generic "FLASH_V" string
+ * alongside the size-specific one and we want the more precise match. */
+static const char *DetectSaveTypeFromROM(const u8 *rom, size_t romSize)
+{
+    static const struct { const char *needle; const char *saveType; } signatures[] = {
+        { "EEPROM_V",   "EEPROM"   },
+        { "SRAM_F_V",   "SRAM"     },
+        { "SRAM_V",     "SRAM"     },
+        { "FLASH512_V", "FLASH512" },
+        { "FLASH1M_V",  "FLASH1M"  },
+        { "FLASH_V",    "FLASH512" }, // bare FLASH_V historically means the 64K/512kbit part
+    };
+
+    for (size_t s = 0; s < sizeof(signatures) / sizeof(signatures[0]); s++) {
+        size_t needleLen = strlen(signatures[s].needle);
+        if (needleLen >= romSize) continue;
+        for (size_t i = 0; i + needleLen <= romSize; i++) {
+            if (memcmp(rom + i, signatures[s].needle, needleLen) == 0)
+                return signatures[s].saveType;
+        }
+    }
+    return NULL;
+}
+
+static void ForceKnownSaveTypeOverrides(struct mCore *core, const u8 *romBuffer, size_t romSize)
+{
+    if (!core || cartridgeType != CARTRIDGE_GBA || romSize < 0xB0)
+        return;
+
+    char gameCode[5];
+    memcpy(gameCode, romBuffer + 0xAC, 4);
+    gameCode[4] = '\0';
+
+    char sectionName[16];
+    snprintf(sectionName, sizeof(sectionName), "override.%s", gameCode);
+
+    // 1. Real detection first: scan the ROM's own bytes for a save-library
+    //    ID string. This is general - it works for any cart, not just ones
+    //    we've hand-listed - and it's a fact about the binary, not a guess.
+    const char *detected = DetectSaveTypeFromROM((const u8 *)romBuffer, romSize);
+    if (detected) {
+        ConfigurationSetValue(&core->config.configTable, sectionName, "savetype", detected);
+        printf("[mGBA] Detected save type for %s from ROM signature: savetype=%s\n",
+               gameCode, detected);
+        return;
+    }
+
+    // 2. No scannable string (game shipped with hand-tuned save code, no
+    //    stock SDK library linked in) - fall back to the hand-confirmed
+    //    per-game table for the rare exceptions that hit this gap.
+    for (size_t i = 0; i < sizeof(knownSaveTypeOverrides) / sizeof(knownSaveTypeOverrides[0]); i++) {
+        if (memcmp(gameCode, knownSaveTypeOverrides[i].gameCode, 4) == 0) {
+            ConfigurationSetValue(&core->config.configTable, sectionName, "savetype",
+                                   knownSaveTypeOverrides[i].saveType);
+            printf("[mGBA] Forced save-type override for %s (no ROM signature found): savetype=%s\n",
+                   gameCode, knownSaveTypeOverrides[i].saveType);
+            return;
+        }
+    }
+
+    // 3. Neither path matched - leave detection to mGBA's own built-in
+    //    overrides.c table (already wired up via mCoreLoadConfig() below)
+    //    and, failing that, its runtime heuristic.
+}
 static u16          *videoBuf         = NULL;
 // Color-correction output buffer, same size as videoBuf, allocated/freed
 // alongside it. NEVER written to by mGBA's core - only by
@@ -270,6 +419,50 @@ static void InitRumbleSource()
 }
 
 /* -------------------------------------------------------------------------
+ * Solar sensor peripheral (mGBA's GBALuminanceSource interface)
+ *
+ * Boktai / Boktai 2: Solar Boy Django / Boktai 3: Sabata's Counterattack
+ * (GBA) have a built-in light sensor cartridge. mGBA's GBA core emulates
+ * the sensor hardware itself, but - unlike rotationSource/rumble above -
+ * nothing in this port ever registered a GBALuminanceSource for it. Boktai
+ * 2's intro includes a mandatory solar-calibration screen that polls the
+ * sensor in a loop waiting for a reading before it will continue; with no
+ * light source attached, that poll is never satisfied and the game hangs
+ * right there - this is what was causing the freeze partway through the
+ * intro dialogue. (Games that don't have this cart hardware simply never
+ * call readLuminance, so registering this unconditionally for every GBA
+ * game is harmless, same reasoning as rotationSource above.)
+ *
+ * The Wii has no ambient light sensor to read a real value from, so like
+ * mGBA's own reference frontends (e.g. the shared GBAGUIRunner's
+ * _readLux(), which this mirrors) we expose an adjustable level instead of
+ * a live reading - driven by the existing SunBars global (0-10, cycled by
+ * the in-game Weather button in menu.cpp's pause menu). GBA_LUX_LEVELS is
+ * mGBA's own 10-entry step table (extern const int[10], declared in
+ * mgba/gba/interface.h - do not redeclare it locally, it's already
+ * exported by the portlib) - the same one the reference GUI runner reads
+ * from. A *lower* register value means *brighter* on real hardware, hence
+ * the 0xFF inversion. */
+static void SolarSample(struct GBALuminanceSource *lux) { (void)lux; }
+
+static uint8_t SolarReadLuminance(struct GBALuminanceSource *lux)
+{
+	(void)lux;
+	int value = 0x16;
+	if (SunBars > 0)
+		value += GBA_LUX_LEVELS[(SunBars > 10 ? 10 : SunBars) - 1];
+	return 0xFF - value;
+}
+
+static struct GBALuminanceSource gSolarSource;
+
+static void InitSolarSource()
+{
+	gSolarSource.sample = SolarSample;
+	gSolarSource.readLuminance = SolarReadLuminance;
+}
+
+/* -------------------------------------------------------------------------
  * Per-game settings memory
  * ---------------------------------------------------------------------- */
 // Remembers GBHardware / SGBBorder / BasicPalette per game, so switching
@@ -416,10 +609,41 @@ static struct mLogger gxLogger = { .log = GXMGBALog };
 /* -------------------------------------------------------------------------
  * Audio — uses mGBA's resampler, feeds vbagx's existing mixerdata ring
  * buffer (audio.cpp) so we don't fight ASND/AUDIO DMA registration.
+ *
+ * Rate correction: PushAudio() runs once per core->runFrame() call, paced
+ * by our own VSync loop - NOT by the audio DMA callback the way mGBA's own
+ * SDL frontend does it (src/platform/sdl/sdl-audio.c). That frontend
+ * derives a "fauxClock" ratio each callback (via mCoreCalculateFramerateRatio)
+ * and feeds the resampler sampleRate/fauxClock instead of the raw sample
+ * rate, so any gap between the core's assumed frame rate and what's
+ * actually being achieved gets corrected before it can accumulate.
+ *
+ * We had no equivalent here - srcRate was fed to the resampler as-is,
+ * with nothing tying audio pacing to real elapsed time. GBA's true frame
+ * rate (~59.7275 Hz) doesn't exactly match Wii's VSync rate either, so
+ * with nothing correcting for the gap it just accumulates for the whole
+ * play session: the mixerdata ring buffer slowly over- or under-runs,
+ * and PushAudio()'s "if (next == consumer) break" / MIXER_GetSamples()'s
+ * silence-on-underrun are exactly the discontinuities that sound like
+ * scratchiness, with the drift itself being the reported desync.
+ *
+ * Rather than hardcode an assumed NTSC/PAL VSync rate the way fauxClock's
+ * "desiredFrameRate" does, this measures real elapsed wall-clock time
+ * between PushAudio() calls directly (self-correcting for NTSC vs. PAL,
+ * frame skip, or any other timing slop, without needing to know which),
+ * compares it to how much emulated time one runFrame() actually
+ * represents, and nudges the source rate fed to the resampler to close
+ * that gap - smoothed and clamped so a one-off stall (e.g. a save write)
+ * doesn't itself cause an audible pitch blip.
  * ---------------------------------------------------------------------- */
 extern u8* GetMixerDataPtr();
 extern volatile int* GetMixerHeadPtr();
 extern volatile int* GetMixerTailPtr();
+
+// video.cpp - returns the real Hz mgba_emuMain()'s VSync loop is currently
+// pacing to (50.0 for true PAL, ~59.94 for everything else). See that
+// function's own comment for why only true PAL differs.
+extern double GetCurrentTVFrameRate();
 
 #define MIXBUFFSIZE_LOCAL 0x10000
 #define MIXERMASK_LOCAL   ((MIXBUFFSIZE_LOCAL >> 2) - 1)
@@ -428,24 +652,98 @@ static bool audioInitialized = false;
 static struct mAudioBuffer    resamplerDest;
 static struct mAudioResampler resampler;
 
+// Wall-clock drift correction state (see comment above). rateRatio is a
+// smoothed multiplier applied to the source rate we tell the resampler;
+// >1.0 means we're falling behind real time (feed audio faster to catch
+// up), <1.0 means we're running ahead (feed it slower).
+static u64    lastPushTicks = 0;
+static double rateRatio     = 1.0;
+
 static void InitMGBAAudio()
 {
-    if (audioInitialized) return;
+    // SwitchAudioMode(0) must run on every ROM load, not just the first —
+    // the menu calls SwitchAudioMode(1) each time it opens, handing the AI
+    // hardware back to ASND. If this only ran once, every ROM load after the
+    // first menu session would push audio into a ring buffer that nobody was
+    // draining (DMA chain stopped, ASND has the hardware). The resampler
+    // buffers only need to be initialized once, so that part stays guarded.
     SwitchAudioMode(0);
+
+    if (audioInitialized) return;
     mAudioBufferInit(&resamplerDest, 4096, 2);
     mAudioResamplerInit(&resampler, mINTERPOLATOR_COSINE);
     mAudioResamplerSetDestination(&resampler, &resamplerDest, 48000);
+    lastPushTicks = gettime();
+
+    // Seed rateRatio from mGBA's own canonical framerate-ratio formula
+    // (the same one mCoreCalculateFramerateRatio() computes: how much
+    // emulated time one runFrame() represents, expressed against the
+    // real display rate we're actually pacing to) rather than always
+    // starting at a flat 1.0 and letting the EMA below drift it into
+    // place over the first several seconds of audio. core is guaranteed
+    // loaded here (InitMGBAAudio() only runs after ROM load), but the
+    // fallback to 1.0 is kept in case frequency()/frameCycles() are ever
+    // unavailable for a given platform.
+    double seedRatio = 1.0;
+    if (core && core->frequency(core) > 0)
+    {
+        double nativeFPS = (double)core->frequency(core) / (double)core->frameCycles(core);
+        seedRatio = GetCurrentTVFrameRate() / nativeFPS;
+        // Keep the seed inside the same band the runtime EMA below is
+        // clamped to, so a bogus core value can't push the very first
+        // buffers out to an audible pitch shift before the EMA can react.
+        if (seedRatio < 0.98) seedRatio = 0.98;
+        if (seedRatio > 1.02) seedRatio = 1.02;
+    }
+    rateRatio = seedRatio;
     audioInitialized = true;
 }
 
 static void PushAudio()
 {
     if (!core || !audioInitialized) return;
+
+    // Re-prime the DMA chain if SwitchAudioMode(1) handed audio to ASND
+    // while the menu was open. Without this, PushAudio fills the ring buffer
+    // but nobody drains it - the DMA callback (AudioPlayer) isn't running.
+    // SoundWii::write() had equivalent logic inline; this calls the shared
+    // helper in audio.cpp that does the same thing (see RestartAudioDMA()).
+    extern void RestartAudioDMA();
+    RestartAudioDMA();
+
     struct mAudioBuffer *coreBuf = core->getAudioBuffer(core);
     if (!coreBuf) return;
     unsigned srcRate = core->audioSampleRate(core);
     if (!srcRate) srcRate = 32768;
-    mAudioResamplerSetSource(&resampler, coreBuf, srcRate, true);
+
+    // How much emulated time one runFrame() call represents, analytically -
+    // this is constant for a given loaded system (GBA vs. GB/GBC have
+    // different clockRate/frameCycles, but the ratio doesn't change while
+    // a ROM is running), so no per-call bookkeeping is needed to derive it.
+    double expectedSeconds = (double)core->frameCycles(core) / (double)core->frequency(core);
+
+    u64 now = gettime();
+    double realSeconds = ticks_to_microsecs(now - lastPushTicks) / 1000000.0;
+    lastPushTicks = now;
+
+    // Guard against a huge one-off gap (ROM just loaded, a save/state
+    // operation stalled a frame, menu was up, etc.) - don't let a single
+    // outlier call yank the correction far in one step.
+    if (realSeconds > 0.0 && realSeconds < expectedSeconds * 4.0)
+    {
+        double instantRatio = realSeconds / expectedSeconds;
+        // Exponential moving average: smooths out per-frame OS scheduling
+        // jitter so the correction itself doesn't introduce an audible
+        // wobble, while still tracking genuine sustained drift over time.
+        rateRatio = rateRatio * 0.98 + instantRatio * 0.02;
+        // Clamp to a narrow band - beyond this a real desync is more likely
+        // a legitimate slowdown (skip frames) than something audio pacing
+        // should try to paper over by pitch-shifting.
+        if (rateRatio < 0.98) rateRatio = 0.98;
+        if (rateRatio > 1.02) rateRatio = 1.02;
+    }
+
+    mAudioResamplerSetSource(&resampler, coreBuf, (unsigned)(srcRate * rateRatio), true);
     mAudioResamplerProcess(&resampler);
     size_t avail = mAudioBufferAvailable(&resamplerDest);
     if (avail == 0) return;
@@ -474,12 +772,24 @@ static void *lastRomData = NULL;
 
 static void UnloadCore()
 {
-    // Flush SRAM to disk before tearing down the core - previously this
-    // never happened here, only in ExitApp(), so returning to the menu and
-    // loading another ROM (or reloading the same one) silently discarded
-    // any unsaved progress since the last full app exit.
-    if (coreRunning && core && GCSettings.AutoSave == 1)
-        SaveBatteryOrStateAuto(FILE_SRAM, SILENT);
+    // No explicit SRAM flush here anymore - see core->unloadROM() just
+    // below. mGBA's own GBA core memory-maps the .sav file directly onto
+    // the same VFile handed to core->loadSave() at ROM-load time
+    // (GBASavedataInitFlash/SRAM/EEPROM -> vf->map(), src/gba/savedata.c)
+    // and keeps that mapping live for the entire session - the game's
+    // actual battery-save writes go straight into it continuously, no
+    // separate flush step needed. It's written back to disk precisely
+    // when core->unloadROM() closes savedata.realVf, right below.
+    //
+    // This used to also call SaveBatteryOrStateAuto(FILE_SRAM, SILENT)
+    // here - opening a SECOND, independent file handle on that exact same
+    // path with O_TRUNC, while the FIRST handle (the one just described)
+    // was still live-mapped and about to be flushed/closed by
+    // core->unloadROM() a few lines later. Two handles to the same file,
+    // one of them truncating it out from under the other's active
+    // mapping, is exactly the kind of thing that silently corrupts or
+    // zeroes a save - this was very likely the actual root cause of saves
+    // being cleared, not just an edge case in the write logic itself.
 
     ShutoffRumble(); // don't let cart rumble carry over across a game switch
 
@@ -1308,6 +1618,54 @@ bool LoadVBAROM()
     }
 
     core->init(core);
+
+    /* Default audio volume - see mCoreLoadConfig()'s own comment just below
+     * for why core->opts (which the "volume" key feeds into) needs an
+     * explicit default before that call, not just an override table.
+     * core->opts.volume is zeroed by _GBACoreInit()'s initial memset and
+     * NEVER GETS SET to anything else unless a "volume" key exists in
+     * config - it's not implicitly "full volume by default" the way you'd
+     * expect. Every real mGBA frontend (SDL, Qt, the official Wii port)
+     * sets this explicitly for exactly that reason. Without it, the GBA/GB
+     * core mixes every sample against a volume of 0 - real audio data
+     * flows through the entire buffer/resampler/DMA pipeline exactly like
+     * it should (correct sample counts, correct timing), it's just
+     * silent, since the actual PCM values are scaled to zero before they
+     * ever leave the core. 0x100 matches mGBA's own GBA_AUDIO_VOLUME_MAX
+     * (src/gba/audio.c) - "1.0x", not a boosted or attenuated value. Must
+     * run before mCoreLoadConfig() so that call actually picks it up. */
+    mCoreConfigSetDefaultIntValue(&core->config, "volume", 0x100);
+
+    /* This is what actually wires up mGBA's built-in per-game override
+     * table (src/gba/overrides.c) - things like forcing Pokemon Ruby to
+     * its real Flash1M (128KB) save type instead of leaving detection to
+     * the GBA core's own runtime heuristic (which infers save type lazily
+     * from which memory region the game's first save-related access
+     * touches, and can guess wrong). core->loadConfig() is what populates
+     * the override-lookup table (GBACore's `overrides` field via
+     * mCoreConfigGetOverridesConst()) that core->reset() consults via
+     * GBAOverrideApplyDefaults() every time the core resets - without
+     * ever calling this, that table stays NULL and every game runs on
+     * pure heuristic auto-detection with no safety net.
+     *
+     * A misdetected save type doesn't just fail to load existing saves -
+     * the core actively RESIZES the save file to match whatever type it
+     * (mis)detects once the game starts running, which is how a real
+     * 128KB Flash save ends up silently truncated down to 8KB (EEPROM's
+     * size) the moment gameplay starts. This is real, destructive data
+     * loss, not just a "reads as fresh" cosmetic issue - it's the actual
+     * root cause of saves silently not carrying over.
+     *
+     * Must be called after core->init() (config loading touches
+     * core->board's config-dependent fields) and before core->reset()
+     * (GBAOverrideApplyDefaults()/_GBCoreLoadConfig's GB equivalent both
+     * run there). mCoreLoadConfig() (vs core->loadConfig() directly) also
+     * pulls in any user-editable config.ini overrides on top of the
+     * built-in table, which is the standard way every other mGBA-based
+     * frontend does this. */
+    ForceKnownSaveTypeOverrides(core, (const u8 *)romBuffer, romSize);
+    mCoreLoadConfig(core);
+
     core->setAudioBufferSize(core, 4096);
 
     /* Wii Remote tilt control (see gTiltSource above) - only meaningful for
@@ -1343,6 +1701,14 @@ bool LoadVBAROM()
     if (cartridgeType == CARTRIDGE_GB || cartridgeType == CARTRIDGE_GBA) {
         InitRumbleSource();
         core->setPeripheral(core, mPERIPH_RUMBLE, &gRumble);
+    }
+
+    /* Solar sensor (see gSolarSource above) - Boktai series only exists on
+     * GBA, so this is gated to CARTRIDGE_GBA rather than registered for
+     * GB/GBC too. */
+    if (cartridgeType == CARTRIDGE_GBA) {
+        InitSolarSource();
+        core->setPeripheral(core, mPERIPH_GBA_LUMINANCE, &gSolarSource);
     }
 
     // Push all config values into the now-initialized core.
@@ -1401,6 +1767,35 @@ bool LoadVBAROM()
         RomIdCode = ((u32)code[0] << 24) | ((u32)code[1] << 16) |
                     ((u32)code[2] <<  8) |  (u32)code[3];
     }
+
+    /* Auto-load SRAM: GCSettings.AutoLoad (0=Off, 1=SRAM, 2=State) already
+     * existed as a menu setting, and LoadBatteryOrStateAuto() already
+     * existed below, but nothing ever actually called it when a ROM boots
+     * - only the manual "Load Game" menu option triggered a load. Auto-save
+     * on exit was already working fine (ExitApp() calls
+     * SaveBatteryOrStateAuto), which is why saves were being written but
+     * never restored on the next launch.
+     *
+     * This MUST run before core->reset(), not after: core->reset() is what
+     * drives GBAOverrideApplyDefaults()/GBASavedataInit() for this cart
+     * (see the comment above core->setVideoBuffer() below), which
+     * establishes the live save-data state from whatever VFile is
+     * currently attached. If no VFile is attached yet - i.e. reset() runs
+     * first - it initializes an empty save area, and attaching the real
+     * .sav file afterward via core->loadSave() does not reliably get its
+     * contents copied into that already-reset state: the open/read
+     * succeeds (correct folder, correct file size) but the game still
+     * boots as if it had no save. Every mGBA reference frontend (see
+     * src/platform, e.g. sdl/main.c) calls mCoreLoadFile -> mCoreAutoloadSave
+     * -> reset() in that order for exactly this reason; ROMFilename is
+     * already populated by this point (set in filebrowser.cpp when the
+     * ROM was selected), so ordering it here costs nothing.
+     *
+     * FILE_SNAPSHOT (save states) is intentionally NOT moved: a state
+     * restores serialized RTC/full-machine state on top of a clean reset,
+     * so it still needs to run after core->reset(), further below. */
+    if (GCSettings.AutoLoad == 1)
+        LoadBatteryOrStateAuto(FILE_SRAM, SILENT);
 
     core->reset(core);
 
@@ -1475,17 +1870,12 @@ bool LoadVBAROM()
     printf("[mGBA] Loaded: %s  type=%d  title=%s\n",
            romPath, cartridgeType, RomTitle);
 
-    /* Auto-load: GCSettings.AutoLoad (0=Off, 1=SRAM, 2=State) already exists
-     * as a menu setting, and LoadBatteryOrStateAuto() already exists below,
-     * but nothing ever actually called it when a ROM boots - only the
-     * manual "Load Game" menu option triggered a load. Auto-save on exit
-     * was already working correctly (ExitApp() calls SaveBatteryOrStateAuto),
-     * which is why saves were being written fine but never restored on the
-     * next launch. Must run after core->reset() (already done above) so the
-     * core has valid save-data state to load into. */
-    if (GCSettings.AutoLoad == 1)
-        LoadBatteryOrStateAuto(FILE_SRAM, SILENT);
-    else if (GCSettings.AutoLoad == 2)
+    /* Auto-load save STATE only, here. SRAM autoload already happened
+     * above, before core->reset() - see the comment there for why. A save
+     * state is different: it's a full serialized snapshot (memory + RTC +
+     * metadata) meant to be restored on top of a freshly-reset core, so it
+     * correctly stays after core->reset(). */
+    if (GCSettings.AutoLoad == 2)
         LoadBatteryOrStateAuto(FILE_SNAPSHOT, SILENT);
 
     /* Always ensure the core has a valid save VFile associated, even for
@@ -1714,13 +2104,53 @@ bool SavePreviewImg(char *filepath, bool silent); // defined below; forward-decl
 bool SaveBatteryOrState(char *filepath, int action, bool silent)
 {
     if (!core) return false;
+
+    // For the SRAM/battery path specifically: clone the savedata BEFORE
+    // opening the destination file at all. VFileOpen(..., O_TRUNC) below
+    // truncates the file the instant it's opened - before we've written
+    // a single byte back. Previously this file was opened first, and only
+    // afterward did we check whether core->savedataClone() actually gave
+    // us anything (if (sram && size > 0)). If it ever came back empty -
+    // save-type detection not fully settled yet, an interrupted exit
+    // sequence, any edge case - that check correctly skipped the WRITE,
+    // but the OPEN had already zeroed the file out from under whatever
+    // was previously saved there. Cloning first means a failed/empty
+    // clone just skips the save entirely, leaving the existing file
+    // completely untouched - worse to skip a save than to silently
+    // destroy a good one.
+    //
+    // NOTE: this function must never be called with the "Auto" slot
+    // (filenum 0) path for FILE_SRAM while a ROM is loaded - see the much
+    // bigger issue documented at the UnloadCore() and MenuGame() call
+    // sites that used to do exactly that.
+    if (action != FILE_SNAPSHOT) {
+        void *sram = NULL;
+        size_t size = core->savedataClone(core, &sram);
+        if (!sram || size == 0) {
+            if (!silent) printf("[mGBA] savedataClone() returned nothing - skipping save, existing file left untouched: %s\n", filepath);
+            if (sram) free(sram);
+            return false;
+        }
+
+        struct VFile *vf = VFileOpen(filepath, O_WRONLY | O_CREAT | O_TRUNC);
+        if (!vf) {
+            if (!silent) printf("[mGBA] Cannot open for write: %s\n", filepath);
+            free(sram);
+            return false;
+        }
+        bool ok = (vf->write(vf, sram, size) == (ssize_t)size);
+        free(sram);
+        vf->close(vf);
+        return ok;
+    }
+
     struct VFile *vf = VFileOpen(filepath, O_WRONLY | O_CREAT | O_TRUNC);
     if (!vf) {
         if (!silent) printf("[mGBA] Cannot open for write: %s\n", filepath);
         return false;
     }
     bool ok = false;
-    if (action == FILE_SNAPSHOT) {
+    {
         // Capture the current frame into gameScreenPng BEFORE writing the
         // state, so SavePreviewImg() below has something to actually save.
         // Previously nothing ever called this, so the preview thumbnail
@@ -1729,14 +2159,6 @@ bool SaveBatteryOrState(char *filepath, int action, bool silent)
         TakeScreenshot();
         ok = mCoreSaveStateNamed(core, vf,
              SAVESTATE_SAVEDATA | SAVESTATE_RTC | SAVESTATE_METADATA);
-    }
-    else {
-        void *sram = NULL;
-        size_t size = core->savedataClone(core, &sram);
-        if (sram && size > 0) {
-            ok = (vf->write(vf, sram, size) == (ssize_t)size);
-            free(sram);
-        }
     }
     vf->close(vf);
 
@@ -1775,7 +2197,22 @@ bool LoadBatteryOrState(char *filepath, int action, bool silent)
             if (!silent) printf("[mGBA] Cannot open for read/write: %s\n", filepath);
             return false;
         }
-        return core->loadSave(core, vf); /* mGBA owns vf now; do not close */
+
+        // Root cause of saves silently not loading (2026-xx-xx): this
+        // function was being reached correctly - right folder, right file,
+        // right size - but was being called *after* core->reset() from the
+        // boot path, which had already initialized an empty save area. See
+        // the autoload comment in LoadVBAROM(), above core->reset(), for
+        // the fix. Kept as a normal silent-gated diagnostic below.
+        if (!silent) {
+            ssize_t existingSize = vf->size(vf);
+            printf("[mGBA] Loading save: %s (SaveMethod=%d SaveFolder=%s, existing size=%d bytes)\n",
+                   filepath, GCSettings.SaveMethod, GCSettings.SaveFolder, (int)existingSize);
+        }
+
+        bool loadOk = core->loadSave(core, vf); /* mGBA owns vf now; do not close */
+        if (!silent) printf("[mGBA] core->loadSave() returned %s\n", loadOk ? "true" : "false");
+        return loadOk;
     }
 
     struct VFile *vf = VFileOpen(filepath, O_RDONLY);
@@ -2060,7 +2497,8 @@ static u16 *DecodeSGBFileToRGB565(const u8 *data, size_t size, int *outW, int *o
  * (negative height) row storage, and BMP's per-row 4-byte padding.
  * Returns NULL on any header/format mismatch (wrong size, unsupported
  * bit depth, compressed, etc). Doesn't validate exact expectedW/H itself -
- * callers check *outW/*outH against what the border slot requires. */
+ * callers check the returned *outW / *outH against what the border slot
+ * requires. */
 static u16 *DecodeBMPToRGB565(const u8 *data, size_t size, int *outW, int *outH)
 {
     if (size < 54 || data[0] != 'B' || data[1] != 'M')

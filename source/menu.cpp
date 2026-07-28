@@ -1900,10 +1900,6 @@ static int MenuGame()
 {
 	int menu = MENU_NONE;
 
-	// Weather menu if a game with Boktai solar sensor
-	bool isBoktai = ((RomIdCode & 0xFF)=='U');
-    char s[64];
-
 	GuiText titleTxt(ROMFilename, 22, (GXColor){255, 255, 255, 255});
 	titleTxt.SetAlignment(ALIGN_LEFT, ALIGN_TOP);
 	titleTxt.SetPosition(50,50);
@@ -1989,42 +1985,9 @@ static int MenuGame()
 	deleteBtn.SetTrigger(trigA);
 	deleteBtn.SetEffectGrow();
 	
-	// Boktai adds an extra button for setting the sun.
-	GuiText *sunBtnTxt = NULL;
-	GuiImage *sunBtnImg = NULL;
-	GuiImage *sunBtnImgOver = NULL;
-	GuiButton *sunBtn = NULL;
-	if (isBoktai) 
-	{
-		struct tm *newtime;
-		time_t long_time;
-
-		// regardless of the weather, there should be no sun at night time!
-		time(&long_time); // Get time as long integer.
-		newtime = localtime(&long_time); // Convert to local time.
-		if (newtime->tm_hour > 21 || newtime->tm_hour < 5)
-		{
-			sprintf(s, "Weather: Night Time");
-		} 
-		else 
-			sprintf(s, "Weather: %d%% sun", SunBars*10);
-		
-		sunBtnTxt = new GuiText(s, 22, (GXColor){0, 0, 0, 255});
-		sunBtnTxt->SetWrap(true, btnLargeOutline.GetWidth()-30);
-		sunBtnImg = new GuiImage(&btnLargeOutline);
-		sunBtnImgOver = new GuiImage(&btnLargeOutlineOver);
-		sunBtn = new GuiButton(btnLargeOutline.GetWidth(), btnLargeOutline.GetHeight());
-		sunBtn->SetAlignment(ALIGN_CENTRE, ALIGN_TOP);
-		sunBtn->SetPosition(0, 380);
-		sunBtn->SetLabel(sunBtnTxt);
-		sunBtn->SetImage(sunBtnImg);
-		sunBtn->SetImageOver(sunBtnImgOver);
-		sunBtn->SetSoundOver(&btnSoundOver);
-		sunBtn->SetSoundClick(&btnSoundClick);
-		sunBtn->SetTrigger(trigA);
-		sunBtn->SetTrigger(trig2);
-		sunBtn->SetEffectGrow();
-	}
+	// The Boktai Weather button used to live here; it's now in the
+	// in-game Game Settings menu (MenuGameSettings(), below) instead - see
+	// the comment there for why.
 
 	GuiText resetBtnTxt("Reset", 22, (GXColor){0, 0, 0, 255});
 	GuiImage resetBtnImg(&btnLargeOutline);
@@ -2172,8 +2135,6 @@ static int MenuGame()
 	w.Append(&resetBtn);
 	w.Append(&cheatsBtn);
 	w.Append(&gameSettingsBtn);
-	if (isBoktai)
-		w.Append(sunBtn);
 
 	#ifdef HW_RVL
 	w.Append(batteryBtn[0]);
@@ -2214,7 +2175,15 @@ static int MenuGame()
 	{
 		if (GCSettings.AutoSave == 1)
 		{
-			SaveBatteryOrStateAuto(FILE_SRAM, SILENT); // save battery
+			// Previously called SaveBatteryOrStateAuto(FILE_SRAM, SILENT)
+			// here. Removed - mGBA's own core keeps the battery save
+			// continuously, safely synced to disk on its own (it's memory-
+			// mapped directly onto the same file for the whole session -
+			// see the comment in UnloadCore(), vbasupport.cpp). That
+			// manual call opened a second, independent handle to the same
+			// file the core still had live-mapped, which could corrupt or
+			// zero it out - on every single pause, not just on exit. There
+			// is nothing left to do for the battery half of this setting.
 		}
 		else if (GCSettings.AutoSave == 2)
 		{
@@ -2225,7 +2194,8 @@ static int MenuGame()
 		{
 			if (WindowPrompt("Save", "Save SRAM and State?", "Save", "Don't Save") )
 			{
-				SaveBatteryOrStateAuto(FILE_SRAM, NOTSILENT); // save battery
+				// See the AutoSave==1 comment just above for why the SRAM
+				// half of this was removed - only the state save remains.
 				SaveBatteryOrStateAuto(FILE_SNAPSHOT, NOTSILENT); // save state
 			}
 		}
@@ -2275,16 +2245,6 @@ static int MenuGame()
 			}
 		}
 		#endif
-
-		if (isBoktai)
-		{
-			if (sunBtn->GetState() == STATE_CLICKED) 
-			{
-				++SunBars;
-				if (SunBars>10) SunBars=0;
-				menu = MENU_GAME;
-			}
-		}
 
 		if(saveBtn.GetState() == STATE_CLICKED)
 		{
@@ -2418,13 +2378,6 @@ static int MenuGame()
 	}
 
 	HaltGui();
-
-	if (isBoktai) {
-		delete sunBtnTxt;
-		delete sunBtnImg;
-		delete sunBtnImgOver;
-		delete sunBtn;
-	}
 
 	#ifdef HW_RVL
 	for(i=0; i < 4; ++i)
@@ -2767,10 +2720,39 @@ static int MenuGameSaves(int action)
 /****************************************************************************
  * MenuGameSettings
  ***************************************************************************/
+// Shared by both the Weather button's initial label (at construction) and
+// its click handler (after SunBars changes) - regardless of the weather
+// setting, there should be no sun at night time.
+static void FormatSunLabel(char *buf, size_t bufSize)
+{
+	time_t long_time;
+	time(&long_time);
+	struct tm *newtime = localtime(&long_time);
+	if (newtime->tm_hour > 21 || newtime->tm_hour < 5)
+		snprintf(buf, bufSize, "Weather: Night Time");
+	else
+		snprintf(buf, bufSize, "Weather: %d%% sun", SunBars * 10);
+}
+
 static int MenuGameSettings()
 {
 	int menu = MENU_NONE;
 	char filepath[1024];
+
+	// Weather button, only for Boktai games with a solar sensor cartridge.
+	// RomIdCode is packed big-endian from the 4-char header game code
+	// (code[0]<<24 | code[1]<<16 | code[2]<<8 | code[3] - see vbasupport.cpp's
+	// LoadVBAROM()); every Boktai release's code starts with "U3" (Boktai =
+	// U3IE/U3IP/U3IJ, Boktai 2 = U32E/U32P/U32J, Boktai 3 = U33J, JP only),
+	// which lives in the top two bytes. This used to live in MenuGame() (the
+	// in-game pause menu) as its own separate button anchored at (0, 380),
+	// which put it directly underneath mainmenuBtn (anchored to the bottom
+	// of that same screen) - overlapping, hard to hit, and mainmenuBtn was
+	// appended after it so it also ate the touch/click in the overlap area.
+	// Living here instead, as a normal grid button alongside Screenshot,
+	// avoids the overlap entirely.
+	bool isBoktai = (((RomIdCode >> 16) & 0xFFFF) == (((u32)'U' << 8) | '3'));
+	char sunLabel[64];
 
 	GuiText titleTxt("Game Settings", 26, (GXColor){255, 255, 255, 255});
 	titleTxt.SetAlignment(ALIGN_LEFT, ALIGN_TOP);
@@ -2831,7 +2813,7 @@ static int MenuGameSettings()
 	GuiImage screenshotBtnIcon(&iconScreenshot);
 	GuiButton screenshotBtn(btnLargeOutline.GetWidth(), btnLargeOutline.GetHeight());
 	screenshotBtn.SetAlignment(ALIGN_CENTRE, ALIGN_TOP);
-	screenshotBtn.SetPosition(0, 250);
+	screenshotBtn.SetPosition(isBoktai ? -125 : 0, 250);
 	screenshotBtn.SetLabel(&screenshotBtnTxt);
 	screenshotBtn.SetImage(&screenshotBtnImg);
 	screenshotBtn.SetImageOver(&screenshotBtnImgOver);
@@ -2840,6 +2822,34 @@ static int MenuGameSettings()
 	screenshotBtn.SetSoundClick(&btnSoundClick);
 	screenshotBtn.SetTrigger(trigA);
 	screenshotBtn.SetEffectGrow();
+
+	// Weather button (see FormatSunLabel() above, and isBoktai above) - only
+	// constructed/shown for Boktai games. Sits in the same row as
+	// Screenshot rather than as a lone centered button, so it doesn't need
+	// its own dedicated row.
+	GuiText *sunBtnTxt = NULL;
+	GuiImage *sunBtnImg = NULL;
+	GuiImage *sunBtnImgOver = NULL;
+	GuiButton *sunBtn = NULL;
+	if (isBoktai)
+	{
+		FormatSunLabel(sunLabel, sizeof(sunLabel));
+		sunBtnTxt = new GuiText(sunLabel, 22, (GXColor){0, 0, 0, 255});
+		sunBtnTxt->SetWrap(true, btnLargeOutline.GetWidth()-30);
+		sunBtnImg = new GuiImage(&btnLargeOutline);
+		sunBtnImgOver = new GuiImage(&btnLargeOutlineOver);
+		sunBtn = new GuiButton(btnLargeOutline.GetWidth(), btnLargeOutline.GetHeight());
+		sunBtn->SetAlignment(ALIGN_CENTRE, ALIGN_TOP);
+		sunBtn->SetPosition(125, 250);
+		sunBtn->SetLabel(sunBtnTxt);
+		sunBtn->SetImage(sunBtnImg);
+		sunBtn->SetImageOver(sunBtnImgOver);
+		sunBtn->SetSoundOver(&btnSoundOver);
+		sunBtn->SetSoundClick(&btnSoundClick);
+		sunBtn->SetTrigger(trigA);
+		sunBtn->SetTrigger(trig2);
+		sunBtn->SetEffectGrow();
+	}
 	
 	GuiText closeBtnTxt("Close", 20, (GXColor){0, 0, 0, 255});
 	GuiImage closeBtnImg(&btnCloseOutline);
@@ -2878,6 +2888,8 @@ static int MenuGameSettings()
 	w.Append(&mappingBtn);
 	w.Append(&videoBtn);
 	w.Append(&screenshotBtn);
+	if (isBoktai)
+		w.Append(sunBtn);
 	w.Append(&closeBtn);
 	w.Append(&backBtn);
 
@@ -2904,6 +2916,37 @@ static int MenuGameSettings()
 				snprintf(filepath, 1024, "%s%s/%s", pathPrefix[GCSettings.LoadMethod], GCSettings.ScreenshotsFolder, ROMFilename);
 				SavePreviewImg(filepath, SILENT); 
 			}
+		}
+		else if(isBoktai && sunBtn->GetState() == STATE_CLICKED)
+		{
+			// This button doesn't set `menu` (clicking it should adjust the
+			// level and keep this screen open, not close it) - same
+			// situation as cheatsBtn above in MenuGame(), and the same fix:
+			// without resetting it explicitly, it's still STATE_CLICKED on
+			// the very next loop iteration, which re-runs this whole branch
+			// again immediately - and keeps doing so, many times per
+			// second, until something external clears it. That's what was
+			// racing SunBars through several 10% steps on a single click
+			// and landing wherever it happened to be when it finally
+			// stopped - and since this is an else-if chain, it also meant
+			// closeBtn/backBtn below were never even checked for as long as
+			// this kept matching first, which is why the screen felt stuck.
+			sunBtn->ResetState();
+
+			// ResetState() above clears back to STATE_DEFAULT - including
+			// the selected/highlighted look, not just the stuck click flag
+			// - so without this, every single press bumped the percentage
+			// AND silently dropped the cursor off the button, meaning
+			// changing it twice took several presses just to navigate back
+			// onto it before the next change could even register. Explicit
+			// re-select keeps the highlight (and the cursor) right where
+			// it was, so repeated presses just keep adjusting the value.
+			sunBtn->SetState(STATE_SELECTED, -1);
+
+			++SunBars;
+			if (SunBars > 10) SunBars = 0;
+			FormatSunLabel(sunLabel, sizeof(sunLabel));
+			sunBtnTxt->SetText(sunLabel);
 		}
 		else if(closeBtn.GetState() == STATE_CLICKED)
 		{
@@ -2935,6 +2978,13 @@ static int MenuGameSettings()
 
 	HaltGui();
 	mainWindow->Remove(&w);
+	if (isBoktai)
+	{
+		delete sunBtnTxt;
+		delete sunBtnImg;
+		delete sunBtnImgOver;
+		delete sunBtn;
+	}
 	return menu;
 }
 

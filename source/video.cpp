@@ -525,6 +525,32 @@ static void SetupVideoMode(GXRModeObj * mode)
 }
 
 /****************************************************************************
+ * GetCurrentTVFrameRate
+ *
+ * Returns the display refresh rate (in Hz) that mgba_emuMain()'s VSync loop
+ * is actually pacing to right now, for the currently active `vmode` (set by
+ * SetupVideoMode() just above). vbasupport.cpp's audio code
+ * (InitMGBAAudio()) uses this to seed its resampler rate-correction ratio
+ * with the same clockRate/(desiredFrameRate*frameCycles) formula mGBA's own
+ * frontends use (mCoreCalculateFramerateRatio), instead of starting from a
+ * flat 1.0 guess and drifting into place over the first few seconds of
+ * audio via wall-clock measurement alone.
+ *
+ * True PAL (50Hz field rate) is the only mode on real Wii hardware whose
+ * refresh meaningfully differs from ~59.94Hz - NTSC, EURGB60/PAL60, and
+ * the 240p variants of both all retrace at the same ~60/1.001 rate as
+ * NTSC. This mirrors the exact (mode->viTVMode >> 2) == VI_PAL check
+ * FindVideoMode() above already uses for VI positioning, so it can never
+ * disagree with what SetupVideoMode() actually configured.
+ ***************************************************************************/
+double GetCurrentTVFrameRate()
+{
+	if (vmode && ((vmode->viTVMode >> 2) == VI_PAL))
+		return 50.0;
+	return 60.0 / 1.001;
+}
+
+/****************************************************************************
  * InitializeVideo
  *
  * This function MUST be called at startup.

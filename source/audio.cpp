@@ -98,6 +98,61 @@ static void AudioPlayer()
 }
 
 /****************************************************************************
+ * RestartAudioDMA
+ *
+ * Lightweight re-prime of the DMA chain for use by PushAudio()
+ * (vbasupport.cpp) after SwitchAudioMode(1) has handed the audio hardware
+ * back to ASND (menu mode). Unlike SwitchAudioMode(0) this doesn't tear
+ * down ASND — by the time PushAudio() is running, the emulator loop is
+ * already active, so if ASND is still alive we just need to stop it cleanly
+ * and hand the AI back to the DMA path. Mirrors the restart logic that
+ * SoundWii::write() used to do inline:
+ *   if (IsPlaying == 0) { ConfigRequested = 0; AudioPlayer(); }
+ * but with a full re-init of the callback and DMA since SwitchAudioMode(1)
+ * may have torn them down.
+ ***************************************************************************/
+void RestartAudioDMA()
+{
+	if (IsPlaying)
+		return; // DMA chain is already running, nothing to do
+
+	// ConfigRequested gates AudioPlayer() (the DMA callback) - see that
+	// function above. It gets set to 1 in a few places (e.g. video.cpp,
+	// after a screenshot) as a "menu/config UI wants the audio hardware"
+	// signal, and needs to be cleared here so the DMA-driven emulator
+	// audio path can actually resume. This used to only be cleared inside
+	// the old VBA-era SoundWii::write() function, which nothing calls
+	// anymore now that audio is fed via PushAudio() (vbasupport.cpp) -
+	// meaning ConfigRequested could get set once and then never cleared
+	// for the rest of the session, permanently silencing audio (the DMA
+	// callback would immediately re-disable itself on every subsequent
+	// tick even after this function re-armed IsPlaying). Clearing it here
+	// instead, in the function that's actually the live "resume real
+	// audio playback" entry point, fixes that for good.
+	ConfigRequested = 0;
+
+	// Mirror SwitchAudioMode(0)'s full sequence - see that function's own
+	// comment for why AUDIO_Init + AUDIO_SetDSPSampleRate are both needed.
+	#ifndef NO_SOUND
+	ASND_Pause(1);
+	ASND_End();
+	AUDIO_StopDMA();
+	AUDIO_RegisterDMACallback(NULL);
+	DSP_Halt();
+	AUDIO_Init(NULL);
+	AUDIO_SetDSPSampleRate(AI_SAMPLERATE_48KHZ);
+	AUDIO_RegisterDMACallback(AudioPlayer);
+	#endif
+	memset(soundbuffer[0],0,3840);
+	memset(soundbuffer[1],0,3840);
+	DCFlushRange(soundbuffer[0],3840);
+	DCFlushRange(soundbuffer[1],3840);
+	AUDIO_InitDMA((u32)soundbuffer[whichab],3200);
+	AUDIO_StartDMA();
+	IsPlaying = 1;
+}
+
+/****************************************************************************
  * StopAudio
  ***************************************************************************/
 
@@ -126,12 +181,26 @@ SwitchAudioMode(int mode)
 {
 	if(mode == 0) // emulator
 	{
+		// See RestartAudioDMA()'s comment on why this needs clearing here
+		// too - this is the other real entry point back into DMA-driven
+		// emulator audio (called by InitMGBAAudio() on every ROM load).
+		ConfigRequested = 0;
+
 		#ifndef NO_SOUND
 		ASND_Pause(1);
 		ASND_End();
 		AUDIO_StopDMA();
 		AUDIO_RegisterDMACallback(NULL);
 		DSP_Halt();
+		// Re-initialize the AI hardware after ASND tears it down. ASND_End()
+		// leaves the AI in an indeterminate state on real Wii hardware
+		// (Dolphin is more forgiving). The NO_SOUND path in InitialiseSound()
+		// already shows the correct complete sequence for raw DMA mode:
+		// AUDIO_Init → AUDIO_SetDSPSampleRate → register callback. Without
+		// both of these calls after ASND_End(), the DMA chain starts but the
+		// hardware plays silence on real hardware.
+		AUDIO_Init(NULL);
+		AUDIO_SetDSPSampleRate(AI_SAMPLERATE_48KHZ);
 		AUDIO_RegisterDMACallback(AudioPlayer);
 		#endif
 		memset(soundbuffer[0],0,3840);
@@ -140,11 +209,14 @@ SwitchAudioMode(int mode)
 		DCFlushRange(soundbuffer[1],3840);
 		AUDIO_InitDMA((u32)soundbuffer[whichab],3200);
 		AUDIO_StartDMA();
+		IsPlaying = 1;
 	}
 	else // menu
 	{
 		IsPlaying = 0;
 		#ifndef NO_SOUND
+		AUDIO_StopDMA();
+		AUDIO_RegisterDMACallback(NULL);
 		DSP_Unhalt();
 		ASND_Init();
 		ASND_Pause(0);
@@ -191,65 +263,32 @@ SoundWii::SoundWii()
 }
 
 /****************************************************************************
-* SoundWii::write
+* SoundWii::write  —  VESTIGIAL / DEAD CODE, kept only for link compatibility
 *
-* Upsample from 11025 to 48000
-* 11025 == 15052
-* 22050 == 30106
-* 44100 == 60211
+* This was the old VBA-era audio path: a fixed-point nearest-neighbor
+* resample (despite the "linear interpolate" comment it used to carry, it
+* never blended between samples - it snapped fixofs>>16 straight to the
+* nearest source index) feeding this file's own mixerdata ring directly.
 *
-* Audio officianados should look away now !
+* Nothing calls this anymore. Real audio output today goes through mGBA's
+* own resampler (mAudioResampler, mINTERPOLATOR_COSINE - the same
+* interpolator mGBA's own official Wii port uses) in PushAudio()
+* (vbasupport.cpp), which writes into this same mixerdata ring via
+* GetMixerHeadPtr()/GetMixerTailPtr() instead of going through this method.
+* That's a strictly higher-quality resample than what this function ever
+* did, so there's no audio-quality reason to keep this implementation
+* around - it's left as a documented no-op rather than deleted outright
+* since audio.h (not in hand at the time of this edit) may still declare
+* SoundWii::write() as part of the class, and something elsewhere may still
+* reference the type even though nothing calls this function in practice.
+* If a future pass confirms no remaining references to the SoundWii class
+* at all, this method (and the class) can be removed entirely.
 ****************************************************************************/
 
 void SoundWii::write(u16 * finalWave, int length)
 {
-	u32 *src = (u32 *)finalWave;
-	u32 *dst = (u32 *)mixerdata;
-	u32 intlen = (DMA_BYTES >> 2);
-	u32 fixofs = 0;
-	u32 fixinc = 60211; // length = 2940 - GB
-        if (gameType == 3)
-                fixinc = 44739;
-        else if (gameType == 2)
-                fixinc = 30065;
-
-	// length is given in u16 samples; the source is read as u32 (one packed
-	// stereo frame), so clamp the highest index we may read. Previously the
-	// length argument was ignored, allowing reads past finalWave.
-	u32 maxSrcIndex = (length > 1) ? (u32)((length >> 1) - 1) : 0;
-
-	// Work on a local copy of the volatile producer index and publish it once
-	// at the end. This avoids a memory round-trip on every loop iteration and
-	// lets us bounds-check against the consumer to prevent overrunning audio
-	// that has not been played yet.
-	int localHead = head;
-	int consumer = tail;
-
-	do
-	{
-		u32 srcIndex = fixofs >> 16;
-		if (srcIndex > maxSrcIndex)
-			srcIndex = maxSrcIndex;
-
-		int next = (localHead + 1) & MIXERMASK;
-		if (next == consumer)
-			break; // ring buffer full: drop rather than clobber unplayed data
-
-		// Do simple linear interpolate, and swap channels from L-R to R-L
-		dst[localHead] = SWAP(src[srcIndex]);
-		localHead = next;
-		fixofs += fixinc;
-	}
-	while( --intlen );
-
-	head = localHead; // publish to the DMA callback
-
-	// Restart Sound Processing if stopped
-	if (IsPlaying == 0)
-	{
-		ConfigRequested = 0;
-		AudioPlayer();
-	}
+	(void)finalWave;
+	(void)length;
 }
 
 bool SoundWii::init(long sampleRate)

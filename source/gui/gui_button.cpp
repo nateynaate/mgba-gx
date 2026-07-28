@@ -272,11 +272,21 @@ void GuiButton::Update(GuiTrigger * t)
 				wiidrc_btns_trig = trigger[i]->wiidrcdata.btns_d;
 
 				if(
+					// Bitwise containment ("does the actual input include the
+					// trigger's expected bit(s)"), not exact equality - a
+					// real controller poll can have OTHER bits set at the
+					// same instant (a genuinely different simultaneous
+					// button, or - especially on Classic Controller, and
+					// especially on a light/partial press - a spurious extra
+					// bit from button-matrix contact bounce). Exact equality
+					// silently drops the intended button's click whenever
+					// that happens, and can spuriously satisfy a completely
+					// different trigger's own equality check instead.
 					(t->wpad->btns_d > 0 &&
-					(wm_btns == wm_btns_trig ||
-					(cc_btns == cc_btns_trig && t->wpad->exp.type == EXP_CLASSIC))) ||
-					(t->pad.btns_d == trigger[i]->pad.btns_d && t->pad.btns_d > 0) ||
-					(wiidrc_btns == wiidrc_btns_trig && wiidrc_btns > 0))
+					(((wm_btns & wm_btns_trig) == wm_btns_trig && wm_btns_trig != 0) ||
+					(((cc_btns & cc_btns_trig) == cc_btns_trig && cc_btns_trig != 0) && t->wpad->exp.type == EXP_CLASSIC))) ||
+					((t->pad.btns_d & trigger[i]->pad.btns_d) == trigger[i]->pad.btns_d && trigger[i]->pad.btns_d > 0) ||
+					((wiidrc_btns & wiidrc_btns_trig) == wiidrc_btns_trig && wiidrc_btns_trig > 0))
 				{
 					if(t->chan == stateChan || stateChan == -1)
 					{
@@ -336,11 +346,14 @@ void GuiButton::Update(GuiTrigger * t)
 				wiidrc_btns_trig = trigger[i]->wiidrcdata.btns_h;
 
 				if(
+					// Same fix as the click-detection block above - see its
+					// comment for why exact equality drops presses/matches
+					// the wrong trigger on a noisy poll.
 					(t->wpad->btns_d > 0 &&
-					(wm_btns == wm_btns_trig ||
-					(cc_btns == cc_btns_trig && t->wpad->exp.type == EXP_CLASSIC))) ||
-					(t->pad.btns_d == trigger[i]->pad.btns_h && t->pad.btns_d > 0) ||
-					(wiidrc_btns == wiidrc_btns_trig && wiidrc_btns > 0))
+					(((wm_btns & wm_btns_trig) == wm_btns_trig && wm_btns_trig != 0) ||
+					(((cc_btns & cc_btns_trig) == cc_btns_trig && cc_btns_trig != 0) && t->wpad->exp.type == EXP_CLASSIC))) ||
+					((t->pad.btns_d & trigger[i]->pad.btns_h) == trigger[i]->pad.btns_h && trigger[i]->pad.btns_h > 0) ||
+					((wiidrc_btns & wiidrc_btns_trig) == wiidrc_btns_trig && wiidrc_btns_trig > 0))
 				{
 					if(trigger[i]->type == TRIGGER_HELD && state == STATE_SELECTED &&
 						(t->chan == stateChan || stateChan == -1))
@@ -349,10 +362,10 @@ void GuiButton::Update(GuiTrigger * t)
 
 				if(
 					(t->wpad->btns_h > 0 &&
-					(wm_btns_h == wm_btns_trig ||
-					(cc_btns_h == cc_btns_trig && t->wpad->exp.type == EXP_CLASSIC))) ||
-					(t->pad.btns_h == trigger[i]->pad.btns_h && t->pad.btns_h > 0) ||
-					(wiidrc_btns_h == wiidrc_btns_trig && wiidrc_btns_h > 0))
+					(((wm_btns_h & wm_btns_trig) == wm_btns_trig && wm_btns_trig != 0) ||
+					(((cc_btns_h & cc_btns_trig) == cc_btns_trig && cc_btns_trig != 0) && t->wpad->exp.type == EXP_CLASSIC))) ||
+					((t->pad.btns_h & trigger[i]->pad.btns_h) == trigger[i]->pad.btns_h && trigger[i]->pad.btns_h > 0) ||
+					((wiidrc_btns_h & wiidrc_btns_trig) == wiidrc_btns_trig && wiidrc_btns_trig > 0))
 				{
 					if(trigger[i]->type == TRIGGER_HELD)
 						held = true;
