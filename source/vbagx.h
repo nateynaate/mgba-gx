@@ -18,7 +18,7 @@
 #include "utils/FreeTypeGX.h"
 
 #define APPNAME 		"mGBA-GX"
-#define APPVERSION 		"1.0.1"
+#define APPVERSION 		"1.1.0"
 #define APPFOLDER 		"mgbagx"
 #define PREF_FILE_NAME 	"settings.xml"
 
@@ -44,6 +44,7 @@ enum
 
 enum {
     SAVEFOLDER_SAVES = 0,
+    SAVEFOLDER_STATES,
     SAVEFOLDER_LENGTH
 };
 
@@ -69,7 +70,8 @@ typedef struct {
 } FolderDef;
 
 const FolderDef saveFolder[] = {
-    { SAVEFOLDER_SAVES,  "saves" }
+    { SAVEFOLDER_SAVES,  "saves" },
+    { SAVEFOLDER_STATES, "states" }
 };
 
 const FolderDef loadFolder[] = {
@@ -115,6 +117,13 @@ enum {
 	FILTER_NONE = 0,
 	FILTER_SCANLINES,
 	FILTER_SCALE2X,
+	// Nearest-neighbor integer prescale + real bilinear final upscale (GX
+	// render-to-texture, two fixed-function passes - see
+	// RenderSharpBilinearPrescale() in video.cpp for the implementation and
+	// why the Wii doesn't need a programmable shader for this, unlike
+	// RetroArch's Wii U-only sharp-bilinear.slangp). Scoped off for SGB-
+	// bordered content and Fixed Pixel Ratio, same as FILTER_SCALE2X above.
+	FILTER_SHARP_BILINEAR,
 	FILTER_LENGTH
 };
 
@@ -258,6 +267,18 @@ struct SGCSettings
 	// emulators).
 	int		FastForwardSpeed;
 
+	// Frameskip: 0 = Off, N = skip N out of every (N+1) rendered frames.
+	// Unlike FastForwardSpeed above, this does NOT change emulation speed
+	// or how many times core->runFrame()/PushAudio() run - every frame is
+	// still emulated and its audio still pushed at normal 1x pace. It only
+	// skips the video-side work (color correction, interframe blending,
+	// GX_Render's texture upload+draw) for the skipped frames, the same
+	// tradeoff EmGBA's Frameskip setting makes - trading displayed
+	// smoothness for freeing up CPU/GX time each real frame, which is what
+	// keeps audio from stuttering on content that's borderline for the
+	// Wii's CPU. Applied in mgba_emuMain() (vbasupport.cpp).
+	int		Frameskip;
+
 	int		BasicPalette;	// 0 - Green   1 - Monochrome   2 - GB Pocket   3 - GB Light
 	int		MotionTilt;		// Wii Remote tilt control for tilt-sensor GB/GBC games (0/1)
 
@@ -305,6 +326,7 @@ struct SGCSettings
 	char	LoadFolder[MAXPATHLEN];  // Path to game files
 	char	LastFileLoaded[MAXPATHLEN]; //Last file loaded filename
 	char	SaveFolder[MAXPATHLEN];  // Path to save files
+	char	StateFolder[MAXPATHLEN]; // Path to save state files - separate from SaveFolder
 	char	ScreenshotsFolder[MAXPATHLEN]; //Path to screenshots files
 	char	CoverFolder[MAXPATHLEN]; 	//Path to cover files
 	char	ArtworkFolder[MAXPATHLEN]; 	//Path to artwork files

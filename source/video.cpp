@@ -74,11 +74,46 @@ static GXTexObj texobj;
 static Mtx view;
 static int vwidth, vheight;
 static int updateScaling;
+
+// Sharp Bilinear filter (FILTER_SHARP_BILINEAR - see vbagx.h): a nearest-
+// neighbor integer prescale of the raw game texture, rendered to this
+// scratch texture, which is then sampled with real bilinear filtering for
+// the final on-screen quad in GX_Render() below. See
+// RenderSharpBilinearPrescale() for the actual two-pass implementation and
+// why this needs two passes instead of one shader (GX has no programmable
+// shader stage to do it in one, unlike RetroArch's sharp-bilinear.slangp).
+//
+// Sized for the largest input this filter is ever applied to (GBA's
+// 240x160, gated in GX_Render() below) at SHARP_BILINEAR_PRESCALE - not
+// SGB-bordered content, which this filter is intentionally scoped off for
+// (same restriction Scale2x already has, for the same reason: correctly
+// compositing a prescaled game image into a non-prescaled border isn't
+// handled here).
+#define SHARP_BILINEAR_PRESCALE 2
+#define SHARP_BILINEAR_MAX_W (240 * SHARP_BILINEAR_PRESCALE)
+#define SHARP_BILINEAR_MAX_H (160 * SHARP_BILINEAR_PRESCALE)
+static u8 sharpBilinearTexMem[SHARP_BILINEAR_MAX_W * SHARP_BILINEAR_MAX_H * 2] ATTRIBUTE_ALIGN(32);
+static GXTexObj sharpBilinearTexObj;
+static int sharpBilinearTexW = -1, sharpBilinearTexH = -1;
+static bool sharpBilinearTexInited = false;
+
 // Actual on-screen rectangle the game quad is drawn into (EFB pixel space,
 // including any TV/scanout-only stretch such as the 240p width doubling or
 // widescreen pillarbox correction). Used to restore normal rendering after a
 // screenshot capture.
 static int liveVX = 0, liveVY = 0, liveVW = 0, liveVH = 0;
+// The GX viewport rectangle actually passed to GX_SetViewport() for normal
+// (non-capture) gameplay rendering this frame. NOT the same thing as
+// liveVX/Y/W/H above: in non-fixed (stretch) scaling mode the real viewport
+// is always the full screen (the quad's on-screen shape instead comes from
+// the square[] vertex positions), while liveV* there is a derived, already
+// cropped-to-the-quad rectangle meant only for the blur/screenshot code.
+// Anything that needs to temporarily borrow the viewport (e.g.
+// RenderSharpBilinearPrescale's off-screen prescale pass) and restore it
+// afterward must restore THIS, not liveV*, or it ends up compositing
+// through an already-cropped viewport and effectively double-applies the
+// aspect correction.
+static int realVX = 0, realVY = 0, realVW = 0, realVH = 0;
 // The game's true, undistorted content size (native resolution x zoom, with
 // no TV-only stretches applied). Used only for cropping screenshots so the
 // stored PNG has correct square-pixel aspect ratio.
@@ -367,6 +402,92 @@ static inline void draw_square_cropped(Mtx v, float u0, float v0, float u1, floa
 
 	GX_SetVtxDesc(GX_VA_POS, GX_INDEX8);
 	GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_S16, 0);
+}
+
+/****************************************************************************
+ * RenderSharpBilinearPrescale
+ *
+ * Pass 1 of the Sharp Bilinear filter (see sharpBilinearTexMem's own
+ * comment above for the overall design). Point-samples texobj (the raw,
+ * small game texture already loaded into texturemem by the caller) into an
+ * offscreen corner of the EFB at borderWidth*SHARP_BILINEAR_PRESCALE x
+ * borderHeight*SHARP_BILINEAR_PRESCALE, then copies that region into
+ * sharpBilinearTexObj as a real texture via GX_CopyTex - the standard GX
+ * render-to-texture technique. Nothing here is a programmable shader; it's
+ * two ordinary textured draws using GX's fixed-function GX_NEAR/GX_LINEAR
+ * texture filter modes, which is all "sharp bilinear" actually is under
+ * the hood - RetroArch's sharp-bilinear.slangp (Wii U only, since original
+ * Wii's GX has no shader stage) just does the same two steps as one
+ * programmable pass instead of two fixed-function ones.
+ *
+ * Caller (GX_Render(), below) is responsible for loading sharpBilinearTexObj
+ * into GX_TEXMAP0 afterward and issuing its own draw_square() call for the
+ * final on-screen quad - this function only handles the prescale pass
+ * itself and leaves the viewport restored to the live on-screen one
+ * (liveVX/Y/W/H) so that follow-up call needs no viewport setup of its own.
+ ***************************************************************************/
+static void RenderSharpBilinearPrescale(int borderWidth, int borderHeight)
+{
+	int prescaleW = borderWidth * SHARP_BILINEAR_PRESCALE;
+	int prescaleH = borderHeight * SHARP_BILINEAR_PRESCALE;
+
+	// Clamp to the EFB's actual bounds - 240p mode has a much shorter
+	// efbHeight than standard modes - and to the scratch buffer's fixed
+	// capacity above. Rounded down to a multiple of 4 to stay aligned with
+	// GX's tiled texture format, same as every real game resolution this
+	// filter runs on already naturally is.
+	if (prescaleW > vmode->fbWidth)   prescaleW = vmode->fbWidth;
+	if (prescaleH > vmode->efbHeight) prescaleH = vmode->efbHeight;
+	if (prescaleW > SHARP_BILINEAR_MAX_W) prescaleW = SHARP_BILINEAR_MAX_W;
+	if (prescaleH > SHARP_BILINEAR_MAX_H) prescaleH = SHARP_BILINEAR_MAX_H;
+	prescaleW &= ~3;
+	prescaleH &= ~3;
+	if (prescaleW <= 0 || prescaleH <= 0)
+		return; // degenerate - bail out, caller falls back to sampling texobj directly
+
+	if (!sharpBilinearTexInited || prescaleW != sharpBilinearTexW || prescaleH != sharpBilinearTexH)
+	{
+		GX_InitTexObj(&sharpBilinearTexObj, sharpBilinearTexMem, prescaleW, prescaleH, GX_TF_RGB565, GX_CLAMP, GX_CLAMP, GX_FALSE);
+		GX_InitTexObjFilterMode(&sharpBilinearTexObj, GX_LINEAR, GX_LINEAR); // this IS the bilinear step - always on for this texture
+		sharpBilinearTexW = prescaleW;
+		sharpBilinearTexH = prescaleH;
+		sharpBilinearTexInited = true;
+	}
+
+	// Pass 1: point-sample the raw game texture into the top-left corner of
+	// the EFB at the prescaled integer size, regardless of what
+	// GCSettings.render's Unfiltered/Filtered Sharp/Filtered Soft setting
+	// would otherwise leave texobj's filter mode at - Sharp Bilinear always
+	// wants a true point-sampled prescale here, that's the whole technique.
+	GX_InitTexObjFilterMode(&texobj, GX_NEAR, GX_NEAR);
+	GX_LoadTexObj(&texobj, GX_TEXMAP0);
+	GX_SetViewport(0, 0, prescaleW, prescaleH, 0, 1);
+	draw_square_cropped(view, 0.0f, 0.0f, 1.0f, 1.0f);
+
+	GX_SetTexCopySrc(0, 0, prescaleW, prescaleH);
+	GX_SetTexCopyDst(prescaleW, prescaleH, GX_TF_RGB565, GX_FALSE);
+	// GX_TRUE also clears the scratch EFB region just read, as part of the
+	// same copy - so the caller's own draw_square() call right after this
+	// doesn't need to fully overdraw this corner itself to avoid leaving a
+	// stray patch of pass-1 pixels visible in this frame's output.
+	GX_CopyTex(sharpBilinearTexMem, GX_TRUE);
+	GX_InvalidateTexAll(); // sharpBilinearTexObj's data just changed on the GPU side - drop any stale cached copy before it's sampled below
+
+	// Restore the real on-screen viewport (computed by UpdateScaling(),
+	// tracked in realVX/Y/W/H) for the caller's normal draw_square() call.
+	//
+	// This must be realV*, NOT liveV*: liveV* is a derived pixel-space
+	// rectangle for the blur/screenshot code and only coincides with the
+	// actual applied viewport in fixed-ratio mode. In non-fixed (stretch)
+	// scaling mode the real viewport is always full-screen - the quad's
+	// on-screen shape comes from the square[] vertex positions instead -
+	// so restoring liveV* there left draw_square() mapping those same
+	// vertex positions through an already-cropped viewport, effectively
+	// applying the aspect correction twice. That was harmless-looking for
+	// GBA (aspect ratio close enough to 4:3 that the double-scaling was
+	// subtle) but produced an obvious vertical squish for GB/GBC, whose
+	// ~1.11:1 aspect is much further off.
+	GX_SetViewport(realVX, realVY, realVW, realVH, 0, 1);
 }
 
 #ifdef HW_RVL
@@ -739,6 +860,7 @@ static inline void UpdateScaling()
 		if (vh > vmode->efbHeight) vh = vmode->efbHeight;
 
 		GX_SetViewport(vx, vy, vw, vh, 0, 1);
+		realVX = (int)vx; realVY = (int)vy; realVW = (int)vw; realVH = (int)vh;
 
 		// Same centering math, but against the RAW (pre-240p-hack) size,
 		// for the reasons above.
@@ -765,6 +887,7 @@ static inline void UpdateScaling()
 		gameVH = nativeH;
 	} else {
 		GX_SetViewport(0, 0, vmode->fbWidth, vmode->efbHeight, 0, 1);
+		realVX = 0; realVY = 0; realVW = vmode->fbWidth; realVH = vmode->efbHeight;
 
 		// The viewport itself is always full-screen in this (non-fixed
 		// zoom) mode - the game quad's real on-screen position/size is
@@ -1295,6 +1418,16 @@ void GX_Render(int gbWidth, int gbHeight, u8 * buffer)
 	                   !InitialBorder && !fixedForCurrentCart &&
 	                   gbWidth <= 240 && gbHeight <= 160;
 
+	// Sharp Bilinear (see sharpBilinearTexMem's comment near the top of this
+	// file for the full design) - scoped off under the same conditions as
+	// Scale2x above, for the same reasons: it's a per-pixel prescale of the
+	// raw game image, and correctly composing that with a border or with
+	// Fixed Pixel Ratio's "N game pixels = N TV pixels" math isn't handled
+	// here yet.
+	bool useSharpBilinear = (GCSettings.FilterMethod == FILTER_SHARP_BILINEAR) &&
+	                         !InitialBorder && !fixedForCurrentCart &&
+	                         gbWidth <= 240 && gbHeight <= 160;
+
 	if (useScale2x)
 	{
 		Scale2xRGB565((const u16 *)buffer, gbWidth + 2, gbWidth, gbHeight,
@@ -1359,13 +1492,56 @@ void GX_Render(int gbWidth, int gbHeight, u8 * buffer)
 	GX_SetNumChans(1);
 	GX_SetZMode(GX_TRUE, GX_LEQUAL, GX_TRUE);
 	GX_SetColorUpdate(GX_TRUE);
-	GX_LoadTexObj(&texobj, GX_TEXMAP0);
+
+	if (useSharpBilinear)
+	{
+		// Runs its own pass-1 draw + GX_CopyTex, then leaves the viewport
+		// restored to the live on-screen one - see its own header comment.
+		RenderSharpBilinearPrescale(borderWidth, borderHeight);
+		GX_LoadTexObj(&sharpBilinearTexObj, GX_TEXMAP0); // bilinear-filtered prescaled texture, not the raw small one
+	}
+	else
+	{
+		// Reassert every frame, not just on the resize-triggered resync
+		// above - RenderSharpBilinearPrescale() unconditionally forces
+		// texobj to GX_NEAR whenever it runs, so if Sharp Bilinear was
+		// active on a previous frame and just got switched off, texobj's
+		// filter mode needs to be put back here regardless of whether its
+		// dimensions changed.
+		GX_InitTexObjFilterMode(&texobj, (GCSettings.render == RENDER_UNFILTERED) ? GX_NEAR : GX_LINEAR, (GCSettings.render == RENDER_UNFILTERED) ? GX_NEAR : GX_LINEAR);
+		GX_LoadTexObj(&texobj, GX_TEXMAP0);
+	}
 
 	draw_square(view); // render textured quad
 	#ifdef HW_RVL
 	draw_cursor(view); // render cursor
 	#endif
-	GX_DrawDone();
+
+	// GX_DrawDone() blocks the CPU until the GPU has fully finished every
+	// queued draw command - a real, synchronous stall, not just a queue
+	// flush. The only thing below that actually needs a completed frame is
+	// TakeScreenshot() (it reads back rendered pixel data, so a torn/
+	// incomplete frame would produce a torn/incomplete screenshot).
+	// VIDEO_SetNextFramebuffer()/VIDEO_Flush()/the copynow handoff further
+	// down don't need this - the real EFB->XFB copy happens later, async,
+	// in copy_to_xfb() at the next physical VBlank (see vbgetback above),
+	// by which point the GPU has had a full frame's worth of real time to
+	// finish on its own.
+	//
+	// This used to run unconditionally every single frame - a genuine CPU
+	// stall waiting on the GPU, on the exact thread that also drives
+	// core->runFrame()/PushAudio() in mgba_emuMain(). Screenshots are rare;
+	// paying this stall on every frame regardless was pure waste, and
+	// intermittent GPU backlog (sharp bilinear's extra pass, a texture
+	// resync, cursor TEV reconfiguration) is a plausible source of the
+	// periodic, not-every-callback audio underrun pattern seen in testing -
+	// a stall here delays the next runFrame()/PushAudio() call in real
+	// wall-clock time even though GB/GBC audio generation itself is
+	// perfectly cycle-accurate inside that call.
+	if (ScreenshotRequested)
+	{
+		GX_DrawDone();
+	}
 
 	if(ScreenshotRequested)
 	{

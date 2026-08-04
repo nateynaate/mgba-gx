@@ -339,7 +339,7 @@ bool MakeFilePath(char filepath[], int type, char * filename, int filenum)
 		{
 			case FILE_SRAM:
 			case FILE_SNAPSHOT:
-				sprintf(folder, GCSettings.SaveFolder);
+				sprintf(folder, (type == FILE_SNAPSHOT) ? GCSettings.StateFolder : GCSettings.SaveFolder);
 
 				if(type == FILE_SRAM) sprintf(ext, "sav");
 				else sprintf(ext, "sgm");

@@ -12,6 +12,7 @@
 #include <string.h>
 #include <strings.h>
 #include <stdarg.h>
+#include <errno.h>
 #include <math.h>
 #include <fcntl.h>
 #include <malloc.h>
@@ -318,6 +319,25 @@ int emulating = 0;
  * that's the sign to flip back, not the overall scale. */
 #define WII_TILT_SCALE 3e8f
 
+// Scale derived the same way as WII_TILT_SCALE above - starting from
+// mGBA's own reference implementation (src/platform/libretro/libretro.c):
+//   gyroZ = sensorGetCallback(GYROSCOPE_Z) * -5.5e8f;
+// where the libretro gyroscope input is in rad/s. Converting our
+// degrees-per-frame yaw delta to rad/s at 60Hz (GB/GBA's native frame
+// rate): degrees_per_frame * 60 * (pi/180) ~= degrees_per_frame * 1.047,
+// then applying the same -5.5e8f scale gives ~ -5.76e8f as the combined
+// per-degree-per-frame constant. Unverified on real hardware - if gyro
+// sensitivity doesn't feel right, this is an experimental starting point,
+// not a confirmed-correct value like WII_TILT_SCALE.
+#define WII_GYRO_SCALE -5.76e8f
+
+// input.cpp - real WiiMotion Plus-backed yaw and the function to request
+// Motion Plus fusion be enabled. input.h isn't available to add these to
+// directly, hence the direct extern here - same pattern as
+// GetCurrentTVFrameRate() above (video.cpp).
+extern void GetWiimoteYaw(float *yaw);
+extern void EnableWiimoteMotionPlus(bool enable);
+
 static void TiltSample(struct mRotationSource *source) { (void)source; }
 
 static int32_t TiltReadX(struct mRotationSource *source)
@@ -339,32 +359,40 @@ static int32_t TiltReadY(struct mRotationSource *source)
 static int32_t TiltReadGyroZ(struct mRotationSource *source)
 {
 	(void)source;
-	// A base Wii Remote (no Motion Plus) has no true gyroscope, so this
-	// can't be a real angular-velocity reading like real gyro-sensor cart
-	// hardware (or WiiMotion Plus) would provide - WarioWare Twisted's own
-	// twist detection may end up feeling different from a real cart or a
-	// PC frontend with a proper gyro. This is a best-effort approximation:
-	// rate of change of the accelerometer-derived roll angle between
-	// frames, as a stand-in for "how fast is this being twisted right
-	// now." Assumes a fixed ~60Hz frame rate (GB/GBA's native rate) rather
-	// than measuring real elapsed time, for simplicity.
+	// Real gyroscope data, backed by WiiMotion Plus (built-in or the
+	// standalone accessory) - see GetWiimoteYaw()'s own comment (input.cpp)
+	// for why a plain Wii Remote's accelerometer fundamentally can't
+	// provide this axis at all, gyro-approximated or otherwise. This
+	// replaces the old accelerometer-roll-delta stand-in that used to live
+	// here - EnableWiimoteMotionPlus() (see the call site in
+	// mgba_emuLoadFile() below) has to have actually been called for
+	// orient.yaw to be gyro-accurate; without it wiiuse still returns
+	// *something* for yaw, just not a meaningfully accurate one, so this
+	// degrades the same way it always did on hardware with no Motion Plus
+	// attached, rather than failing outright.
 	//
-	// Scale derived the same way as WII_TILT_SCALE - starting from mGBA's
-	// own reference implementation (src/platform/libretro/libretro.c):
-	//   gyroZ = sensorGetCallback(GYROSCOPE_Z) * -5.5e8f;
-	// where the libretro gyroscope input is in rad/s. Converting our
-	// degrees-per-frame roll delta to rad/s at 60Hz: degrees_per_frame *
-	// 60 * (pi/180) ~= degrees_per_frame * 1.047, then applying the same
-	// -5.5e8f scale gives ~ -5.76e8f as the combined per-degree-per-frame
-	// constant. Unverified on real hardware - if this doesn't feel right,
-	// this is an experimental starting point, not a confirmed-correct
-	// value like WII_TILT_SCALE.
-	#define WII_GYRO_SCALE -5.76e8f
-	static float lastRoll = 0.0f;
-	float tx, ty;
-	GetWiimoteTilt(&tx, &ty);
-	float delta = tx - lastRoll;
-	lastRoll = tx;
+	// orient.yaw is a cumulative ANGLE (-180..180 degrees), not a rate, so
+	// this still needs a frame-to-frame delta to get the angular velocity
+	// readGyroZ expects - same shape as the old approximation, just fed
+	// from a real gyro instead of accelerometer roll. Unlike accelerometer
+	// roll (which never exceeds +-90), yaw can wrap from +180 to -180
+	// during an actual fast spin - exactly the motion this axis exists to
+	// detect - so the delta is normalized to the shortest angular distance
+	// before scaling, or a full spin would register as one enormous
+	// spurious spike instead of a smooth continuous rotation rate.
+	//
+	// Scale: same WII_GYRO_SCALE derivation as before this change (see its
+	// own definition above) - degrees-per-frame at GB/GBA's native ~60Hz,
+	// converted to rad/s, then mGBA's own libretro.c reference scale
+	// applied. That derivation didn't depend on which sensor the degrees
+	// came from, so it still applies unchanged here.
+	static float lastYaw = 0.0f;
+	float yaw;
+	GetWiimoteYaw(&yaw);
+	float delta = yaw - lastYaw;
+	lastYaw = yaw;
+	if (delta > 180.0f) delta -= 360.0f;
+	else if (delta < -180.0f) delta += 360.0f;
 	return (int32_t)(delta * WII_GYRO_SCALE);
 }
 
@@ -607,34 +635,22 @@ static void GXMGBALog(struct mLogger *logger, int category,
 static struct mLogger gxLogger = { .log = GXMGBALog };
 
 /* -------------------------------------------------------------------------
- * Audio — uses mGBA's resampler, feeds vbagx's existing mixerdata ring
- * buffer (audio.cpp) so we don't fight ASND/AUDIO DMA registration.
+ * Audio — reverted back to a polling model, called once per emulated frame
+ * from mgba_emuMain() below, instead of the mAVStream/setAVStream callback
+ * registration this briefly went through.
  *
- * Rate correction: PushAudio() runs once per core->runFrame() call, paced
- * by our own VSync loop - NOT by the audio DMA callback the way mGBA's own
- * SDL frontend does it (src/platform/sdl/sdl-audio.c). That frontend
- * derives a "fauxClock" ratio each callback (via mCoreCalculateFramerateRatio)
- * and feeds the resampler sampleRate/fauxClock instead of the raw sample
- * rate, so any gap between the core's assumed frame rate and what's
- * actually being achieved gets corrected before it can accumulate.
+ * Why: core->setAVStream() could never be confirmed to be a real, correct
+ * mCore API for primary gameplay audio. mGBA's own documented frontend
+ * pattern for audio is the pull-based getAudioBuffer()/setAudioBufferSize()
+ * model, and mAVStream itself looks like it's actually the AV
+ * capture/recording interface (GIF/video export - postVideoFrame,
+ * videoDimensionsChanged), not the playback path. Rather than ship an
+ * architecture that's likely solving this with the wrong subsystem on top
+ * of an unconfirmed API, this goes back to a known-shape polling call.
  *
- * We had no equivalent here - srcRate was fed to the resampler as-is,
- * with nothing tying audio pacing to real elapsed time. GBA's true frame
- * rate (~59.7275 Hz) doesn't exactly match Wii's VSync rate either, so
- * with nothing correcting for the gap it just accumulates for the whole
- * play session: the mixerdata ring buffer slowly over- or under-runs,
- * and PushAudio()'s "if (next == consumer) break" / MIXER_GetSamples()'s
- * silence-on-underrun are exactly the discontinuities that sound like
- * scratchiness, with the drift itself being the reported desync.
- *
- * Rather than hardcode an assumed NTSC/PAL VSync rate the way fauxClock's
- * "desiredFrameRate" does, this measures real elapsed wall-clock time
- * between PushAudio() calls directly (self-correcting for NTSC vs. PAL,
- * frame skip, or any other timing slop, without needing to know which),
- * compares it to how much emulated time one runFrame() actually
- * represents, and nudges the source rate fed to the resampler to close
- * that gap - smoothed and clamped so a one-off stall (e.g. a save write)
- * doesn't itself cause an audible pitch blip.
+ * The resampler setup itself (mAudioResampler, mINTERPOLATOR_COSINE, 48000
+ * destination) is kept as-is - that part was never in question, only how
+ * often/how it gets pumped.
  * ---------------------------------------------------------------------- */
 extern u8* GetMixerDataPtr();
 extern volatile int* GetMixerHeadPtr();
@@ -645,111 +661,223 @@ extern volatile int* GetMixerTailPtr();
 // function's own comment for why only true PAL differs.
 extern double GetCurrentTVFrameRate();
 
+// audio.cpp - re-primes the DMA chain if SwitchAudioMode(1) handed audio to
+// ASND while the menu was open. Called from PushAudio() below, once per
+// emulated frame.
+extern void RestartAudioDMA();
+
 #define MIXBUFFSIZE_LOCAL 0x10000
 #define MIXERMASK_LOCAL   ((MIXBUFFSIZE_LOCAL >> 2) - 1)
 
 static bool audioInitialized = false;
 static struct mAudioBuffer    resamplerDest;
 static struct mAudioResampler resampler;
+static double fpsRatio = 1.0;
+static unsigned lastCoreRate = 0;  // last core->audioSampleRate() seen; mAudioResamplerSetSource()
+                                    // is only ever called again when this actually changes (e.g. GBA
+                                    // SOUNDBIAS mid-game). GB/GBC never changes this mid-game.
 
-// Wall-clock drift correction state (see comment above). rateRatio is a
-// smoothed multiplier applied to the source rate we tell the resampler;
-// >1.0 means we're falling behind real time (feed audio faster to catch
-// up), <1.0 means we're running ahead (feed it slower).
-static u64    lastPushTicks = 0;
-static double rateRatio     = 1.0;
+// --- Periodic real-time recalibration ------------------------------------
+// fpsRatio (InitMGBAAudio(), below) is computed once per ROM load from
+// GetCurrentTVFrameRate()'s NOMINAL value (50.0/59.94) divided into the
+// core's native FPS. That assumes mgba_emuMain() actually achieves that
+// many real callbacks per second. In testing this doesn't hold on GB/GBC:
+// per-frame video cost (color LUT application, interframe blending,
+// texture upload) plus the vsync wait in GX_Render() means the ACHIEVED
+// callback rate sits measurably below the nominal TV rate. Because the
+// resampler's source rate is set once from the nominal assumption, it
+// keeps handing the DMA path fewer real samples per real second than the
+// DMA (a fixed 48kHz hardware clock) drains - not a one-off stall, but a
+// small constant deficit on essentially every DMA callback, which is
+// exactly the "short by 65/800 words, every callback" pattern seen in
+// testing rather than the occasional-big-gap pattern a rare GPU stall
+// would produce.
+//
+// --- Periodic real-time recalibration (superseded, see below) -----------
+// An earlier pass here added a "measure the real achieved frame rate and
+// periodically recompute the resampler source rate from it" scheme, aimed
+// at the same sustained-deficit pattern found in the underrun log. That's
+// now handled more directly for GB/GBC by the ported VBA-GX dynamic-rate-
+// control driver (GBC_AudioGetDynamicRate(), audio.cpp) - a continuous,
+// hysteresis-gated correction driven by actual DMA-queue occupancy rather
+// than an inferred frame-rate estimate, applied via lightweight linear
+// interpolation on already-resampled output (ResampleChunkForDynamicRate()
+// below) instead of a periodic mAudioResamplerSetSource() call. That
+// approach directly measures the thing that actually matters (is the DMA
+// queue draining faster than it's being filled) instead of inferring it
+// from frame timing, so the wall-clock recalibration scaffolding was
+// removed rather than layered on top of it.
 
-static void InitMGBAAudio()
+// --- Why there's no per-frame rate nudging here anymore ------------------
+// An earlier version of this function re-called mAudioResamplerSetSource()
+// whenever a smoothed FIFO-occupancy estimate said the source rate should
+// be nudged by a fraction of a percent, to keep resamplerDest from slowly
+// drifting empty or full relative to its halfway mark. That reasoning was
+// sound, but mAudioResamplerSetSource() resets the cosine interpolator's
+// internal phase every time it is called - there is no phase-preserving
+// "just nudge the ratio" entry point in mGBA's resampler API. Because the
+// occupancy estimate wobbles by a small amount essentially every frame,
+// even a deadbanded version of that nudge still re-armed (and therefore
+// phase-reset) far too often. Each reset is a small discontinuity in the
+// output stream; on GB/GBC's hard-edged PSG square/pulse waves that is
+// audible as crackle/harshness, especially on a sustained tone (the
+// DuckTales title-screen synth lead that flagged this). GBA's Direct
+// Sound output is smoother/noisier already and mostly masks the same
+// discontinuities, which is why this only stood out on GB/GBC.
+//
+// The fix is to stop treating "FIFO is a little off-center" as a reason
+// to reset resampler phase at all. The source rate is set once per ROM
+// load (InitMGBAAudio(), from the core's nominal audioSampleRate() times
+// fpsRatio) and only re-armed here if the core itself reports a genuinely
+// different sample rate. Any slow FIFO drift from imperfect frame pacing
+// is absorbed by resamplerDest's headroom (16384 samples - see
+// InitMGBAAudio()'s comment) instead of being fought sample-by-sample;
+// that headroom is exactly what's needed to make occasional under/over
+// fill inaudible without ever touching the resampler's phase.
+
+// --- GB/GBC dynamic-rate chunk resample -----------------------------------
+// --- GB/GBC dynamic-rate resample: continuous-phase, not per-chunk -------
+// The previous version of this stage resampled each 800-frame DMA chunk
+// independently (fresh 0..N mapping every call), which resets the linear
+// interpolator's fractional phase at every chunk boundary - the same class
+// of bug as the mAudioResamplerSetSource() phase-reset issue this whole
+// GBC driver was built to avoid, just reintroduced one layer up. Measured
+// against a real hardware mGBA recording, that showed up as a genuinely
+// elevated noise floor from ~12kHz up (aliasing/imaging from the resample,
+// not clipping) across nearly the entire clip, plus the whole recording
+// finishing 0.77% early - meaning the DMA queue was in DRAINING almost
+// continuously, so the stretch was active on nearly every chunk, not
+// occasionally.
+//
+// Fix: track a persistent fractional read position into an accumulation
+// buffer across PushAudio() calls, so consecutive chunks are phase-
+// continuous - a small streaming resampler instead of N independent ones.
+static s16   s_gbcAccum[20480 * 2];
+static int   s_gbcAccumCount = 0;   // valid stereo frames currently in s_gbcAccum, starting at index 0
+static double s_gbcReadPos = 0.0;   // fractional read position into s_gbcAccum, persists across calls
+
+// Push audio-quality diagnostics: running average of the dynamic-rate
+// multiplier actually applied, printed periodically over telnet. If this
+// sits consistently above/below 1.0 rather than oscillating around it,
+// that's the DMA queue chronically running in one direction (draining or
+// filling) rather than just absorbing normal jitter - a sign the root
+// cause is a genuine average rate mismatch upstream (fpsRatio / achieved
+// frame rate), not something this corrector should be fully compensating
+// for on its own.
+static double s_gbcRateSum = 0.0;
+static u32    s_gbcRateSamples = 0;
+static u64    s_gbcLastRatePrint = 0;
+
+static void PushAudioGBC(const int16_t* fresh, size_t freshCount)
 {
-    // SwitchAudioMode(0) must run on every ROM load, not just the first —
-    // the menu calls SwitchAudioMode(1) each time it opens, handing the AI
-    // hardware back to ASND. If this only ran once, every ROM load after the
-    // first menu session would push audio into a ring buffer that nobody was
-    // draining (DMA chain stopped, ASND has the hardware). The resampler
-    // buffers only need to be initialized once, so that part stays guarded.
-    SwitchAudioMode(0);
+    // Append the freshly-resampled frames onto the accumulation buffer.
+    size_t room = (sizeof(s_gbcAccum) / (2 * sizeof(s16))) - s_gbcAccumCount;
+    if (freshCount > room) freshCount = room; // clamp - should not realistically be hit
+    memcpy(&s_gbcAccum[s_gbcAccumCount * 2], fresh, freshCount * 2 * sizeof(s16));
+    s_gbcAccumCount += (int)freshCount;
 
-    if (audioInitialized) return;
-    mAudioBufferInit(&resamplerDest, 4096, 2);
-    mAudioResamplerInit(&resampler, mINTERPOLATOR_COSINE);
-    mAudioResamplerSetDestination(&resampler, &resamplerDest, 48000);
-    lastPushTicks = gettime();
-
-    // Seed rateRatio from mGBA's own canonical framerate-ratio formula
-    // (the same one mCoreCalculateFramerateRatio() computes: how much
-    // emulated time one runFrame() represents, expressed against the
-    // real display rate we're actually pacing to) rather than always
-    // starting at a flat 1.0 and letting the EMA below drift it into
-    // place over the first several seconds of audio. core is guaranteed
-    // loaded here (InitMGBAAudio() only runs after ROM load), but the
-    // fallback to 1.0 is kept in case frequency()/frameCycles() are ever
-    // unavailable for a given platform.
-    double seedRatio = 1.0;
-    if (core && core->frequency(core) > 0)
+    while (GBC_AudioCanWrite())
     {
-        double nativeFPS = (double)core->frequency(core) / (double)core->frameCycles(core);
-        seedRatio = GetCurrentTVFrameRate() / nativeFPS;
-        // Keep the seed inside the same band the runtime EMA below is
-        // clamped to, so a bogus core value can't push the very first
-        // buffers out to an audible pitch shift before the EMA can react.
-        if (seedRatio < 0.98) seedRatio = 0.98;
-        if (seedRatio > 1.02) seedRatio = 1.02;
+        double rate = GBC_AudioGetDynamicRate();
+        s_gbcRateSum += rate;
+        s_gbcRateSamples++;
+
+        // Do we have enough lookahead to produce a full 800-frame chunk at
+        // this rate without running past the data we actually have?
+        double endPos = s_gbcReadPos + rate * 799.0;
+        if ((int)endPos + 1 >= s_gbcAccumCount) break; // not enough source yet - wait for the next PushAudio() call
+
+        s16* dst = (s16*)GBC_AudioGetWriteBuffer();
+        double pos = s_gbcReadPos;
+        for (int i = 0; i < 800; i++) {
+            int i0 = (int)pos;
+            double frac = pos - i0;
+            s16 l0 = s_gbcAccum[i0*2],     r0 = s_gbcAccum[i0*2+1];
+            s16 l1 = s_gbcAccum[(i0+1)*2], r1 = s_gbcAccum[(i0+1)*2+1];
+            dst[i*2]   = (s16)(l0 + (l1 - l0) * frac);
+            dst[i*2+1] = (s16)(r0 + (r1 - r0) * frac);
+            pos += rate;
+        }
+        GBC_AudioCommitWrite();
+        s_gbcReadPos = pos;
     }
-    rateRatio = seedRatio;
-    audioInitialized = true;
+
+    // Compact: drop whole frames already consumed off the front so the
+    // accumulation buffer doesn't grow unbounded, adjusting the fractional
+    // read position to match instead of resetting it (that reset is
+    // exactly the phase discontinuity this rewrite is fixing).
+    int consumedWhole = (int)s_gbcReadPos;
+    if (consumedWhole > 0) {
+        int remaining = s_gbcAccumCount - consumedWhole;
+        if (remaining > 0)
+            memmove(s_gbcAccum, &s_gbcAccum[consumedWhole * 2], (size_t)remaining * 2 * sizeof(s16));
+        s_gbcAccumCount = remaining;
+        s_gbcReadPos -= consumedWhole;
+    }
+
+    // Periodic diagnostic: average applied rate over the last ~1s. A
+    // sustained bias away from 1.0 here (rather than the average hovering
+    // right around it) points at the upstream production/consumption rate
+    // still being systematically off, not just needing this corrector's
+    // hysteresis to smooth out normal jitter.
+    if (s_gbcRateSamples >= 60) {
+        u64 now = gettime();
+        if (s_gbcLastRatePrint == 0 || ticks_to_microsecs(now - s_gbcLastRatePrint) > 1000000) {
+            // TEST: starvation/fade-in deltas over the same ~1s window, to
+            // check whether the ring is going empty far more often than
+            // the smoothed unplayed=N figure alone would suggest.
+            static u32 lastStarve = 0, lastFadeIn = 0;
+            u32 starveNow, fadeInNow;
+            GBC_AudioGetFadeStats(&starveNow, &fadeInNow);
+            printf("[audio][gbc] avg dynamic rate=%.5f over %lu chunks (unplayed=%d) starve+%lu fadein+%lu\n",
+                s_gbcRateSum / s_gbcRateSamples, (unsigned long)s_gbcRateSamples, GBC_AudioGetUnplayed(),
+                (unsigned long)(starveNow - lastStarve), (unsigned long)(fadeInNow - lastFadeIn));
+            lastStarve = starveNow;
+            lastFadeIn = fadeInNow;
+            s_gbcRateSum = 0.0;
+            s_gbcRateSamples = 0;
+            s_gbcLastRatePrint = now;
+        }
+    }
 }
 
+// Called once per emulated frame from mgba_emuMain() below. Pulls whatever
+// the core has produced through the resampler and drains the result into
+// vbagx's existing mixerdata ring buffer (audio.cpp) - the consumer side
+// (MIXER_GetSamples/AudioPlayer's DMA callback) is untouched.
 static void PushAudio()
 {
     if (!core || !audioInitialized) return;
 
-    // Re-prime the DMA chain if SwitchAudioMode(1) handed audio to ASND
-    // while the menu was open. Without this, PushAudio fills the ring buffer
-    // but nobody drains it - the DMA callback (AudioPlayer) isn't running.
-    // SoundWii::write() had equivalent logic inline; this calls the shared
-    // helper in audio.cpp that does the same thing (see RestartAudioDMA()).
-    extern void RestartAudioDMA();
-    RestartAudioDMA();
-
-    struct mAudioBuffer *coreBuf = core->getAudioBuffer(core);
-    if (!coreBuf) return;
+    // Only re-point the resampler's source when the core's reported rate
+    // actually changes (GBA's SOUNDBIAS can do this mid-game; GB/GBC
+    // normally won't). This is now the ONLY condition that calls
+    // mAudioResamplerSetSource() outside of InitMGBAAudio() - see the
+    // block comment above for why per-frame drift nudging was removed
+    // entirely rather than just throttled.
     unsigned srcRate = core->audioSampleRate(core);
     if (!srcRate) srcRate = 32768;
-
-    // How much emulated time one runFrame() call represents, analytically -
-    // this is constant for a given loaded system (GBA vs. GB/GBC have
-    // different clockRate/frameCycles, but the ratio doesn't change while
-    // a ROM is running), so no per-call bookkeeping is needed to derive it.
-    double expectedSeconds = (double)core->frameCycles(core) / (double)core->frequency(core);
-
-    u64 now = gettime();
-    double realSeconds = ticks_to_microsecs(now - lastPushTicks) / 1000000.0;
-    lastPushTicks = now;
-
-    // Guard against a huge one-off gap (ROM just loaded, a save/state
-    // operation stalled a frame, menu was up, etc.) - don't let a single
-    // outlier call yank the correction far in one step.
-    if (realSeconds > 0.0 && realSeconds < expectedSeconds * 4.0)
-    {
-        double instantRatio = realSeconds / expectedSeconds;
-        // Exponential moving average: smooths out per-frame OS scheduling
-        // jitter so the correction itself doesn't introduce an audible
-        // wobble, while still tracking genuine sustained drift over time.
-        rateRatio = rateRatio * 0.98 + instantRatio * 0.02;
-        // Clamp to a narrow band - beyond this a real desync is more likely
-        // a legitimate slowdown (skip frames) than something audio pacing
-        // should try to paper over by pitch-shifting.
-        if (rateRatio < 0.98) rateRatio = 0.98;
-        if (rateRatio > 1.02) rateRatio = 1.02;
+    if (srcRate != lastCoreRate) {
+        lastCoreRate = srcRate;
+        mAudioResamplerSetSource(&resampler, core->getAudioBuffer(core),
+            (unsigned)(srcRate * fpsRatio), true);
     }
 
-    mAudioResamplerSetSource(&resampler, coreBuf, (unsigned)(srcRate * rateRatio), true);
+    RestartAudioDMA();
+
     mAudioResamplerProcess(&resampler);
     size_t avail = mAudioBufferAvailable(&resamplerDest);
     if (avail == 0) return;
-    static int16_t tmp[4096 * 2];
-    if (avail > 4096) avail = 4096;
+    static int16_t tmp[16384 * 2];
+    if (avail > 16384) avail = 16384;
     mAudioBufferRead(&resamplerDest, tmp, avail);
+
+    if (cartridgeType == CARTRIDGE_GB) {
+        PushAudioGBC(tmp, avail);
+        return;
+    }
+
+    // GBA: unchanged continuous ring push into audio.cpp's mixerdata.
     u32 *src = (u32 *)tmp;
     u32 *dst = (u32 *)GetMixerDataPtr();
     volatile int *headPtr = GetMixerHeadPtr();
@@ -764,6 +892,67 @@ static void PushAudio()
         localHead = next;
     }
     *headPtr = localHead;
+}
+
+static void InitMGBAAudio()
+{
+    // Must run before SwitchAudioMode(0) below - it decides which DMA
+    // callback (GBA ring vs GBC dynamic-rate queue) SwitchAudioMode(0)
+    // actually registers. cartridgeType is already resolved by this point
+    // (set from core->platform() earlier in LoadMGBAROM(), before init).
+    AudioSetPlatform(cartridgeType == CARTRIDGE_GB);
+
+    // SwitchAudioMode(0) must run on every ROM load, not just the first —
+    // the menu calls SwitchAudioMode(1) each time it opens, handing the AI
+    // hardware back to ASND. If this only ran once, every ROM load after the
+    // first menu session would push audio into a ring buffer that nobody was
+    // draining (DMA chain stopped, ASND has the hardware). The resampler
+    // buffers only need to be initialized once, so that part stays guarded.
+    SwitchAudioMode(0);
+
+    if (!audioInitialized)
+    {
+        // 16384 (4x the old 4096) - see PushAudio()'s block comment on
+        // GBInterrupt()'s early-exit backpressure mechanism for why a
+        // too-small buffer here specifically hurts GB/GBC: it's cheap on
+        // Wii's RAM (16384 stereo s16 samples = 64KB) and gives real
+        // headroom against a single runFrame() call producing more audio
+        // than one frame's nominal amount before we get back to drain it.
+        mAudioBufferInit(&resamplerDest, 16384, 2);
+        // FIX: mINTERPOLATOR_COSINE (mGBA's own Wii-port default) has weak
+        // stopband rejection on the core-rate->48000 resample and was the
+        // confirmed source of a broadband noise floor audible under game
+        // audio. Measured via matched-gain recordings, comparing genuine
+        // silent passages: cosine floor ~-56dBFS, sinc floor ~-73 to
+        // -83dBFS across 8-24kHz (~17dB improvement, near the 16-bit
+        // theoretical floor of ~-96dBFS). All other candidates (DMA queue
+        // draining, volume scalar, the custom linear interpolator in
+        // PushAudioGBC(), fpsRatio TV/native-rate compensation, fade-in/
+        // starvation ramps) were individually tested and ruled out first -
+        // see audio.cpp / vbasupport.cpp comments near
+        // mAudioResamplerInit()/mAudioResamplerProcess() for that trail.
+        mAudioResamplerInit(&resampler, mINTERPOLATOR_SINC);
+        mAudioResamplerSetDestination(&resampler, &resamplerDest, 48000);
+
+        audioInitialized = true;
+    }
+
+    // Everything below runs on every ROM load, not just the first - core is
+    // a fresh instance each time (see UnloadCore()/LoadVBAROM()), so its
+    // own resampler source and fpsRatio both need re-establishing per-ROM
+    // even though the resampler buffers themselves are reused.
+    if (!core) return;
+
+    double nativeFPS = 60.0; // matches the reference's own flat fallback (fps = 60.0/1.001)
+    if (core->frequency(core) > 0 && core->frameCycles(core) > 0)
+        nativeFPS = (double)core->frequency(core) / (double)core->frameCycles(core);
+    fpsRatio = GetCurrentTVFrameRate() / nativeFPS;
+
+    unsigned srcRate = core->audioSampleRate(core);
+    if (!srcRate) srcRate = 32768;
+    lastCoreRate = srcRate;
+    mAudioResamplerSetSource(&resampler, core->getAudioBuffer(core),
+        (unsigned)(srcRate * fpsRatio), true);
 }
 /* -------------------------------------------------------------------------
  * Teardown
@@ -1096,6 +1285,7 @@ static void mgba_emuMain(int count)
     }
 
     core->runFrame(core);
+    PushAudio();
 
     // Index 0 = off (matches old on/off meaning exactly, so existing saved
     // settings.xml values of 0/1 keep working unchanged). Indices 2+ are
@@ -1110,6 +1300,33 @@ static void mgba_emuMain(int count)
         NULL, &kMatrixGambatte, &kMatrixGBA, &kMatrixAGS101, &kMatrixVBA, &kMatrixPSP, &kMatrixNDS
     };
     #define MATRIX_COUNT(arr) (int)(sizeof(arr) / sizeof(arr[0]))
+
+    // Frameskip: GCSettings.Frameskip (0 = Off, N = skip N out of every
+    // N+1 frames) is unrelated to FastForwardSpeed above - it doesn't touch
+    // how many times core->runFrame() runs each real frame, which stays
+    // at normal 1x cadence here. It only skips the video-side work below
+    // (color correction, interframe blending, GX_Render's texture upload
+    // and draw) on the skipped frames, trading displayed smoothness for
+    // freed-up CPU/GX time each real frame - the same tradeoff EmGBA's
+    // Frameskip setting makes, and why it can visibly help audio/gameplay
+    // smoothness on content that's borderline for the Wii's CPU even at
+    // normal speed.
+    static int frameskipCounter = 0;
+    bool skipVideoThisFrame = false;
+    if (GCSettings.Frameskip > 0) {
+        frameskipCounter++;
+        if (frameskipCounter <= GCSettings.Frameskip) {
+            skipVideoThisFrame = true;
+        } else {
+            frameskipCounter = 0;
+        }
+    } else {
+        frameskipCounter = 0;
+    }
+
+    if (skipVideoThisFrame) {
+        return;
+    }
 
     const u16 *renderBuf = videoBuf; // default: no color emulation, render mGBA's buffer directly
 
@@ -1179,7 +1396,10 @@ static void mgba_emuMain(int count)
         videoInited = true;
     }
     GX_Render(gbCoreW, gbCoreH, (u8 *)renderBuf);
-    PushAudio();
+    // Audio is pumped earlier in this function, right after each
+    // core->runFrame() call - before the frameskip early-return above -
+    // so it keeps flowing every emulated frame regardless of whether video
+    // gets skipped this frame.
 }
 
 static void mgba_emuReset()
@@ -1634,7 +1854,16 @@ bool LoadVBAROM()
      * ever leave the core. 0x100 matches mGBA's own GBA_AUDIO_VOLUME_MAX
      * (src/gba/audio.c) - "1.0x", not a boosted or attenuated value. Must
      * run before mCoreLoadConfig() so that call actually picks it up. */
-    mCoreConfigSetDefaultIntValue(&core->config, "volume", 0x100);
+    int defaultVolume = 0x100;
+    // TEST: GB's 0xC0 anti-clipping attenuation temporarily removed to
+    // isolate whether it's the source of the flat, broadband ~-70dB noise
+    // floor heard in GB/GBC audio (see audio.cpp for the spectral
+    // analysis). If that floor disappears with defaultVolume=0x100 for
+    // GB too, the 0xC0 multiply (applied with unknown internal precision
+    // inside the core's mixer) is confirmed as the cause, and a
+    // non-lossy way to get clipping headroom - if still needed - should
+    // be found instead of reintroducing a blind attenuation here.
+    mCoreConfigSetDefaultIntValue(&core->config, "volume", defaultVolume);
 
     /* This is what actually wires up mGBA's built-in per-game override
      * table (src/gba/overrides.c) - things like forcing Pokemon Ruby to
@@ -1666,7 +1895,16 @@ bool LoadVBAROM()
     ForceKnownSaveTypeOverrides(core, (const u8 *)romBuffer, romSize);
     mCoreLoadConfig(core);
 
-    core->setAudioBufferSize(core, 4096);
+    // 16384, up from 4096 - see PushAudio()'s comment. If this fills up
+    // mid-frame, GBAudioSample() (src/gb/audio.c) calls GBInterrupt(),
+    // which force-exits core->runFrame() before the frame's cycles are
+    // actually done - the frontend is expected to drain audio and call
+    // runFrame() again, which mgba_emuMain() below does not do. Making
+    // this buffer big enough that a single frame's audio production can't
+    // fill it is the cheap fix that doesn't require restructuring the
+    // frame loop to call runFrame() in a drain-and-retry cycle like the
+    // reference frontends do.
+    core->setAudioBufferSize(core, 16384);
 
     /* Wii Remote tilt control (see gTiltSource above) - only meaningful for
      * GB/GBC carts, and only some of those actually have a tilt sensor to
@@ -1688,6 +1926,14 @@ bool LoadVBAROM()
     if ((cartridgeType == CARTRIDGE_GB || cartridgeType == CARTRIDGE_GBA) && GCSettings.MotionTilt) {
         InitTiltSource();
         core->setPeripheral(core, mPERIPH_ROTATION, &gTiltSource);
+
+        // Request WiiMotion Plus fusion (see EnableWiimoteMotionPlus's own
+        // comment, input.cpp) so TiltReadGyroZ() above gets real gyro-
+        // accurate orient.yaw instead of wiiuse's inaccurate non-Plus
+        // fallback - this is what actually fixes WarioWare Twisted's
+        // twist detection; readTiltX/readTiltY (MBC7/Yoshi accelerometer
+        // games) don't need this and are unaffected either way.
+        EnableWiimoteMotionPlus(true);
     }
 
     /* Cart rumble (see gRumble above) - Pokemon Pinball (GB) and Pokemon

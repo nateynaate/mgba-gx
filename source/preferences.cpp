@@ -171,7 +171,8 @@ preparePrefsData ()
 	createXMLSetting("LoadFolder", "Load Folder", GCSettings.LoadFolder);
 	createXMLSetting("LastFileLoaded", "Last File Loaded", GCSettings.LastFileLoaded);
 	createXMLSetting("SaveFolder", "Save Folder", GCSettings.SaveFolder);
-	createXMLSetting("AppendAuto", "Append Auto to .SAV Files", toStr(GCSettings.AppendAuto));
+	createXMLSetting("StateFolder", "Save State Folder", GCSettings.StateFolder);
+	createXMLSetting("AppendAuto", "Append 'Auto' to Auto-Save Filenames", toStr(GCSettings.AppendAuto));
 	createXMLSetting("GBFolder", "GB Folder", GCSettings.GBFolder);
 	createXMLSetting("GBCFolder", "GBC Folder", GCSettings.GBCFolder);
 	createXMLSetting("GBAFolder", "GBA Folder", GCSettings.GBAFolder);
@@ -219,6 +220,7 @@ preparePrefsData ()
 	createXMLSetting("GBCColorEmulation", "GBC Color Emulation", toStr(GCSettings.GBCColorEmulation));
 	createXMLSetting("InterframeBlending", "Interframe Blending", toStr(GCSettings.InterframeBlending));
 	createXMLSetting("FastForwardSpeed", "Fast Forward Speed", toStr(GCSettings.FastForwardSpeed));
+	createXMLSetting("Frameskip", "Frameskip", toStr(GCSettings.Frameskip));
 	createXMLSetting("FilterMethod", "Video Filter", toStr(GCSettings.FilterMethod));
 	
 	createXMLSection("Controller", "Controller Settings");
@@ -464,15 +466,18 @@ decodePrefsData ()
 	bool result = false;
 
 	xml = mxmlLoadString(NULL, (char *)savebuffer, MXML_TEXT_CALLBACK);
+	printf("[prefs] mxmlLoadString -> %s\n", xml ? "non-null" : "NULL");
 
 	if(xml)
 	{
 		// check settings version
 		// we don't do anything with the version #, but we'll store it anyway
 		item = mxmlFindElement(xml, xml, "file", "version", NULL, MXML_DESCEND);
+		printf("[prefs] <file version=...> element -> %s\n", item ? "found" : "NOT FOUND");
 		if(item) // a version entry exists
 		{
 			const char * version = mxmlElementGetAttr(item, "version");
+			printf("[prefs] version attr = \"%s\"\n", version ? version : "(null)");
 
 			if(version && strlen(version) == 5)
 			{
@@ -503,6 +508,8 @@ decodePrefsData ()
 			}
 		}
 
+		printf("[prefs] decodePrefsData: version check result = %s\n", result ? "true" : "false");
+
 		if(result)
 		{
 			// File Settings
@@ -514,6 +521,7 @@ decodePrefsData ()
 			loadXMLSetting(GCSettings.LoadFolder, "LoadFolder", sizeof(GCSettings.LoadFolder));
 			loadXMLSetting(GCSettings.LastFileLoaded, "LastFileLoaded", sizeof(GCSettings.LastFileLoaded));
 			loadXMLSetting(GCSettings.SaveFolder, "SaveFolder", sizeof(GCSettings.SaveFolder));
+			loadXMLSetting(GCSettings.StateFolder, "StateFolder", sizeof(GCSettings.StateFolder));
 			loadXMLSetting(&GCSettings.AppendAuto, "AppendAuto");
 			loadXMLSetting(GCSettings.GBFolder, "GBFolder", sizeof(GCSettings.GBFolder));
 			loadXMLSetting(GCSettings.GBCFolder, "GBCFolder", sizeof(GCSettings.GBCFolder));
@@ -590,6 +598,7 @@ decodePrefsData ()
 				loadXMLSetting(&GCSettings.GBCColorEmulation, "GBCColorCorrection");
 			loadXMLSetting(&GCSettings.InterframeBlending, "InterframeBlending");
 			loadXMLSetting(&GCSettings.FastForwardSpeed, "FastForwardSpeed");
+			loadXMLSetting(&GCSettings.Frameskip, "Frameskip");
 			loadXMLSetting(&GCSettings.FilterMethod, "FilterMethod");
 		}
 		mxmlDelete(xml);
@@ -693,6 +702,7 @@ DefaultSettings ()
 	GCSettings.SaveMethod = DEVICE_AUTO; // Auto, SD, USB, Network (SMB)
 	sprintf (GCSettings.LoadFolder, "%s/%s", APPFOLDER, loadFolder[LOADFOLDER_ROMS].name); // Path to game files
 	sprintf (GCSettings.SaveFolder, "%s/%s", APPFOLDER, saveFolder[SAVEFOLDER_SAVES].name); // Path to save files
+	sprintf (GCSettings.StateFolder, "%s/%s", APPFOLDER, saveFolder[SAVEFOLDER_STATES].name); // Path to save state files
 	sprintf (GCSettings.GBFolder, "%s/%s", APPFOLDER, loadFolder[LOADFOLDER_GB].name); // Path to GB rom files
 	sprintf (GCSettings.GBCFolder, "%s/%s", APPFOLDER, loadFolder[LOADFOLDER_GBC].name); // Path to GBC rom files
 	sprintf (GCSettings.GBAFolder, "%s/%s", APPFOLDER, loadFolder[LOADFOLDER_GBA].name); // Path to GBA rom files
@@ -739,6 +749,7 @@ DefaultSettings ()
 	GCSettings.GBCColorEmulation = 0;
 	GCSettings.InterframeBlending = 0; // Off by default - only a handful of games rely on it
 	GCSettings.FastForwardSpeed = 0; // Off (1x) by default
+	GCSettings.Frameskip = 0; // Off by default
 	GCSettings.FilterMethod = FILTER_NONE; // Off by default - stylistic choice, let people opt in
 	
 #ifdef HW_RVL
@@ -801,6 +812,8 @@ SavePrefs (bool silent)
 	if(device == DEVICE_AUTO)
 		return false;
 
+	printf("[prefs] SavePrefs: device=%d filepath=%s\n", device, filepath);
+
 	if (!silent)
 		ShowAction ("Saving preferences...");
 
@@ -810,6 +823,7 @@ SavePrefs (bool silent)
 	datasize = preparePrefsData ();
 
 	offset = SaveFile(filepath, datasize, silent);
+	printf("[prefs] SaveFile(%s, %d bytes) -> offset=%d\n", filepath, datasize, offset);
 
 	FreeSaveBuffer ();
 
@@ -841,9 +855,12 @@ LoadPrefsFromMethod (char * path)
 	AllocSaveBuffer ();
 
 	offset = LoadFile(filepath, SILENT);
+	printf("[prefs] LoadFile(%s) -> offset=%d\n", filepath, offset);
 
-	if (offset > 0)
+	if (offset > 0) {
 		retval = decodePrefsData ();
+		printf("[prefs] decodePrefsData() -> %s\n", retval ? "true" : "false");
+	}
 
 	FreeSaveBuffer ();
 
@@ -901,11 +918,13 @@ bool LoadPrefs()
 #endif
 
 	for(int i=0; i<numDevices; i++) {
+		printf("[prefs] LoadPrefs: trying %s\n", filepath[i]);
 		prefFound = LoadPrefsFromMethod(filepath[i]);
 
 		if(prefFound)
 			break;
 	}
+	printf("[prefs] LoadPrefs: prefFound=%s\n", prefFound ? "true" : "false");
 
 	// Background music is a bundled default asset, not something read out of
 	// settings.xml - it must load regardless of whether a prefs file was
@@ -945,7 +964,7 @@ void CreateMissingDirectories() {
     char defaultFolder[MAXPATHLEN];
 
     if (GCSettings.SaveMethod > DEVICE_AUTO && ChangeInterface(GCSettings.SaveMethod, NOTSILENT)) {
-        const char* savePointers[] = { GCSettings.SaveFolder };
+        const char* savePointers[] = { GCSettings.SaveFolder, GCSettings.StateFolder };
 
         for (int i = 0; i < SAVEFOLDER_LENGTH; i++) {
             const char* currentPath = savePointers[i];

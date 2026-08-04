@@ -173,6 +173,20 @@ void ResetControls(int wiiCtrl)
  * Scans pad and wpad
  ***************************************************************************/
 
+#ifdef HW_RVL
+// Motion Plus retry state - see EnableWiimoteMotionPlus()'s comment further
+// below for why this needs to be a persistent, periodically-reasserted
+// request rather than a single fire-and-forget call. Declared here (ahead
+// of both UpdatePads() and EnableWiimoteMotionPlus() below) since
+// UpdatePads() needs to read/update it every frame.
+static bool motionPlusWanted = false;
+static int motionPlusRetryTimer = 0;
+#define MOTIONPLUS_RETRY_FRAMES 90 // ~1.5s at 60Hz - spaced out so a retry
+                                    // doesn't just restart a handshake that
+                                    // was already in progress and about to
+                                    // succeed on its own
+#endif
+
 void
 UpdatePads()
 {
@@ -183,6 +197,52 @@ UpdatePads()
 {
     userInput[i].wpad = WPAD_Data(i);
 }
+
+	// Re-assert WiiMotion Plus if it's still wanted (see
+	// EnableWiimoteMotionPlus()'s own comment above for why a single
+	// fire-and-forget request isn't reliable) - spaced out by
+	// MOTIONPLUS_RETRY_FRAMES rather than every frame, since the request
+	// kicks off a real hardware handshake that needs room to complete on
+	// its own before the next nudge.
+	//
+	// Also re-issues WPAD_SetDataFormat alongside it. This is a separate,
+	// previously-unaddressed possibility: some libogc/wiiuse builds reset
+	// the Wiimote's requested report mode back to a Motion-Plus-unaware
+	// one once the extension handshake completes, which would explain the
+	// remaining symptom precisely - ordinary buttons (part of the base
+	// report, unaffected either way) keep working, while orient.yaw fusion
+	// specifically never engages. Re-asserting the format here costs
+	// nothing if that's not actually what's happening on this libogc
+	// version - it's a one-line WPAD state write, not a hardware
+	// round-trip - so it's a safe thing to also do rather than confirmed
+	// necessary.
+	if(motionPlusWanted)
+	{
+		if(motionPlusRetryTimer > 0)
+			motionPlusRetryTimer--;
+		else
+		{
+			WPAD_SetMotionPlus(WPAD_CHAN_ALL, 1);
+			WPAD_SetDataFormat(WPAD_CHAN_ALL, WPAD_FMT_BTNS_ACC_IR);
+			motionPlusRetryTimer = MOTIONPLUS_RETRY_FRAMES;
+
+			// Diagnostic only - prints roughly every MOTIONPLUS_RETRY_FRAMES
+			// frames while Motion Plus is wanted, visible over USB Gecko/
+			// Dolphin console the same way this codebase's other boot-time
+			// printf()s already are (see e.g. "[mGBA] Loaded: ..." in
+			// vbasupport.cpp). exp.type lets you confirm on real hardware
+			// whether wiiuse is actually reporting a Motion-Plus-alive
+			// expansion type at all (its numeric value is enough to compare
+			// run-to-run even without knowing libogc's exact enum names),
+			// and orient.yaw lets you tell "never engages" apart from
+			// "engages but the delta scale in vbasupport.cpp's
+			// TiltReadGyroZ is just wrong" - two very different next fixes.
+			if(userInput[0].wpad)
+				printf("[MotionPlus] chan0 exp.type=%d err=%d orient.yaw=%.2f\n",
+					userInput[0].wpad->exp.type, userInput[0].wpad->err,
+					userInput[0].wpad->orient.yaw);
+		}
+	}
 	#endif
 
 	PAD_ScanPads();
@@ -242,10 +302,77 @@ GetWiimoteTilt(float *tiltX, float *tiltY)
 }
 
 /****************************************************************************
- * SetupPads
+ * GetWiimoteYaw
  *
- * Sets up userInput triggers for use
+ * Returns the Wii Remote's current yaw (in degrees, -180..180) - rotation
+ * around the axis pointing straight out of the screen at the player, i.e.
+ * exactly the "twist" motion WarioWare Twisted's real cartridge gyro
+ * measures. This is the one axis GetWiimoteTilt() above genuinely can't
+ * provide: a plain accelerometer measures the direction of gravity, which
+ * doesn't change at all when you spin the remote around that axis while
+ * holding it flat - roll/pitch are enough to tell it's tilted, but nothing
+ * about an accelerometer-only reading can tell it's being twisted. wiiuse
+ * only computes a real, drift-corrected wpad->orient.yaw once a WiiMotion
+ * Plus (either the standalone accessory or a built-in Plus remote) has
+ * been detected and enabled via EnableWiimoteMotionPlus() below - without
+ * one, yaw is left inaccurate/unusable, same underlying limitation
+ * TiltReadGyroZ()'s old accelerometer-delta approximation (vbasupport.cpp)
+ * existed to work around.
  ***************************************************************************/
+void
+GetWiimoteYaw(float *yaw)
+{
+	*yaw = 0.0f;
+#ifdef HW_RVL
+	if(userInput[0].wpad && userInput[0].wpad->err == WPAD_ERR_NONE)
+	{
+		*yaw = userInput[0].wpad->orient.yaw;
+	}
+#endif
+}
+
+/****************************************************************************
+ * EnableWiimoteMotionPlus
+ *
+ * Requests (or releases) WiiMotion Plus fusion for every connected Wii
+ * Remote channel. Called from vbasupport.cpp only for carts that actually
+ * have a gyro sensor and only while GCSettings.MotionTilt is on (see that
+ * call site's own comment) - not unconditionally at startup - since
+ * enabling Motion Plus triggers a brief extension-port re-sync handshake
+ * on real hardware (WPAD_SetMotionPlus's own doc comment in libogc), which
+ * would otherwise add a startup hitch to every single game, tilt-sensor or
+ * not.
+ *
+ * That handshake is asynchronous - it's driven by subsequent WPAD reports,
+ * not completed inline within this call - so a single fire-and-forget
+ * request can race it (e.g. if the extension port hasn't finished
+ * settling yet) and silently never take effect for the rest of the
+ * session, with no error surfaced anywhere: wiiuse just keeps computing
+ * orient.yaw the old non-Plus way, which is indistinguishable from "it's
+ * working, just inaccurate" until you actually try to use it. To make
+ * this self-healing, the request is latched here and re-issued
+ * periodically from UpdatePads() (below) for as long as it's wanted,
+ * rather than only once at the moment this function is called.
+ *
+ * Harmless to call for remotes that don't actually have a Motion Plus
+ * accessory/built-in - WPAD_SetMotionPlus applies per-channel and simply
+ * has no effect for a channel where none is detected; wiiuse keeps
+ * computing orient.yaw the old (inaccurate, non-gyro) way for that channel
+ * exactly as it did before this function existed.
+ ***************************************************************************/
+void
+EnableWiimoteMotionPlus(bool enable)
+{
+#ifdef HW_RVL
+	WPAD_SetMotionPlus(WPAD_CHAN_ALL, enable ? 1 : 0);
+	if (enable)
+		WPAD_SetDataFormat(WPAD_CHAN_ALL, WPAD_FMT_BTNS_ACC_IR);
+	motionPlusWanted = enable;
+	motionPlusRetryTimer = MOTIONPLUS_RETRY_FRAMES;
+#endif
+}
+
+
 void
 SetupPads()
 {
@@ -744,19 +871,20 @@ static u32 DecodeJoy(unsigned short pad)
 	int wpad_exp_type = userInput[pad].wpad->exp.type;
 	bool isWUPC = userInput[pad].wpad->exp.classic.type == 2;
 
-	if(wpad_exp_type == WPAD_EXP_NONE)
-	{ // wiimote
-
-		for (u32 i =0; i < MAXJP; ++i)
-		{
-			if ((pad_btns_h & btnmap[CTRLR_GCPAD][i]) // gamecube controller
-					|| ( wiidrcp_btns_h & btnmap[CTRLR_WIIDRC][i] ) //wii u gamepad
-					|| ( (wpad_btns_h & btnmap[CTRLR_WIIMOTE][i]) ))
-			J |= vbapadmap[i];
-		}
-
-	}
-	else if(wpad_exp_type == WPAD_EXP_CLASSIC)
+	// Classify by which passthrough peripheral (if any) is attached, not by
+	// testing wpad_exp_type == WPAD_EXP_NONE directly. Enabling WiiMotion
+	// Plus on a bare Wii Remote (no Nunchuk attached - e.g. WarioWare
+	// Twisted, which needs Motion Plus for its gyro but has nothing plugged
+	// into the extension port) makes wiiuse report a distinct Motion-Plus
+	// exp.type, NOT WPAD_EXP_NONE. That previously fell through to the
+	// final "else" below, which never reads wpad_btns_h at all - so every
+	// Wii Remote button (not just the gyro reading) silently stopped
+	// working the instant Motion Plus attached. Explicitly checking for
+	// Nunchuk/Classic and treating everything else as the plain-Wiimote
+	// case (which also covers WPAD_EXP_NONE) fixes this regardless of
+	// which Motion-Plus-variant enum value libogc reports, including any
+	// Motion-Plus-passthrough-Nunchuk combination.
+	if(wpad_exp_type == WPAD_EXP_CLASSIC)
 	{ // classic controller
 		if (isWUPC) {
 			for (u32 i = 0; i < MAXJP; ++i)
@@ -776,7 +904,7 @@ static u32 DecodeJoy(unsigned short pad)
 		}
 	}
 	else if(wpad_exp_type == WPAD_EXP_NUNCHUK)
-	{ // nunchuk + wiimote
+	{ // nunchuk + wiimote (with or without Motion Plus passthrough)
 
 		for (u32 i =0; i < MAXJP; ++i)
 		{
@@ -786,9 +914,19 @@ static u32 DecodeJoy(unsigned short pad)
 		}
 	}
 	else
-	// Check out this trickery!
-	// If all else fails OR if HW_RVL is undefined, the result is the same
-#endif
+	{ // wiimote alone - WPAD_EXP_NONE, or any Motion Plus variant with
+	  // nothing plugged into the extension port (e.g. WarioWare Twisted)
+
+		for (u32 i =0; i < MAXJP; ++i)
+		{
+			if ((pad_btns_h & btnmap[CTRLR_GCPAD][i]) // gamecube controller
+					|| ( wiidrcp_btns_h & btnmap[CTRLR_WIIDRC][i] ) //wii u gamepad
+					|| ( (wpad_btns_h & btnmap[CTRLR_WIIMOTE][i]) ))
+			J |= vbapadmap[i];
+		}
+
+	}
+#else
 	{
 		for (u32 i = 0; i < MAXJP; ++i)
 		{
@@ -796,6 +934,7 @@ static u32 DecodeJoy(unsigned short pad)
 				J |= vbapadmap[i];
 		}
 	}
+#endif
 	return J;
 }
 

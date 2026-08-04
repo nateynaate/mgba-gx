@@ -16,6 +16,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <vector>
+#include <algorithm>
 #include <sys/stat.h>
 
 #ifdef HW_RVL
@@ -963,6 +965,20 @@ SettingWindow(const char * title, GuiWindow * w)
 	okBtn.SetSoundOver(&btnSoundOver);
 	okBtn.SetSoundClick(&btnSoundClick);
 	okBtn.SetTrigger(trigA);
+	// Focus-independent Confirm, mirroring cancelBtn's focus-independent
+	// trigB below (both use SetButtonOnlyTrigger - fires regardless of
+	// what currently has focus, unlike trigA which only fires when okBtn
+	// itself is focused/selected). Needed because some SettingWindow
+	// content (e.g. ScreenZoomWindow's four zoom arrows) legitimately
+	// consumes all four D-pad directions for its own adjustment, leaving
+	// no D-pad direction free to shift focus off that content and onto
+	// okBtn on a GameCube or Classic Controller - Wiimote IR pointing
+	// isn't affected since it clicks okBtn directly regardless of focus.
+	// Without this, okBtn's trigA can never fire on those screens and
+	// there's no way to confirm/save with a digital-only controller.
+	GuiTrigger trigConfirm;
+	trigConfirm.SetButtonOnlyTrigger(-1, WPAD_BUTTON_PLUS | WPAD_CLASSIC_BUTTON_PLUS, PAD_TRIGGER_Z, WIIDRC_BUTTON_PLUS);
+	okBtn.SetTrigger(&trigConfirm);
 	okBtn.SetEffectGrow();
 
 	GuiText cancelBtnTxt("Cancel", 22, (GXColor){0, 0, 0, 255});
@@ -977,7 +993,20 @@ SettingWindow(const char * title, GuiWindow * w)
 	cancelBtn.SetSoundOver(&btnSoundOver);
 	cancelBtn.SetSoundClick(&btnSoundClick);
 	cancelBtn.SetTrigger(trigA);
-	cancelBtn.SetTrigger(trigB);
+	// No focus-independent trigB here (unlike WindowPrompt's cancelBtn) -
+	// deliberately left off so B falls through to mainWindow's existing
+	// ToggleFocus() (gui_window.cpp), which already cycles focus between
+	// mainWindow's direct children (promptWindow <-> w) on B/1. With
+	// trigB bound directly to this button, B fired an immediate cancel
+	// before that cross-window focus shift could ever be seen - which is
+	// also what made it impossible to ever reach okBtn/cancelBtn by pad
+	// on screens like ScreenZoomWindow, whose content consumes all four
+	// D-pad directions. Without it: B moves focus from the content
+	// window onto this promptWindow (landing on okBtn - see
+	// MoveSelectionVert's left-distance tie-break in gui_window.cpp),
+	// Left/Right then moves between okBtn and cancelBtn, and A confirms
+	// whichever is selected. A second B press cycles focus back to the
+	// content window to keep adjusting.
 	cancelBtn.SetEffectGrow();
 
 	promptWindow.Append(&dialogBoxImg);
@@ -1170,13 +1199,62 @@ static void WindowCredits(void * ptr)
 /****************************************************************************
  * Recent Games list
  *
- * GCSettings.RecentROMs stores full device-qualified paths (e.g.
- * "sd:/mgbagx/roms/gba/Foo.gba"), most-recent-first, '|'-delimited, capped
- * at MAX_RECENT_ROMS entries. Unlike the GB/GBC/GBA tabs (a real directory
- * scan of one folder), the Recent tab's entries can each live in a
- * different folder/device, so it's built as a synthetic browserList rather
- * than via OpenGameList()/ParseDirectory().
+ * GCSettings.RecentROMs stores one entry per game, most-recent-first,
+ * '|'-delimited, capped at MAX_RECENT_ROMS entries. Each entry is itself
+ * "path<RECENT_FIELD_SEP>displayname<RECENT_FIELD_SEP>size" - the display
+ * name and file size are cached at AddRecentROM() time (once, right after
+ * a game successfully boots) rather than recomputed every time the Recent
+ * tab is opened.
+ *
+ * RECENT_FIELD_SEP was originally '\x01' (on the theory that a raw control
+ * byte could never collide with a real path or display name) - but this
+ * is settings.xml field, and XML 1.0 forbids raw control characters
+ * outright, not just ones that need escaping. There is no valid escape for
+ * 0x01 in XML at all, so Mini-XML correctly refused to parse the file back
+ * out on the very next boot after any game was added to the recent list -
+ * and because that failure was a single mxmlLoadString() call for the
+ * WHOLE settings.xml, it silently reset every setting to defaults on every
+ * subsequent boot, not just RecentROMs. ':' gives the same "can't collide
+ * with real content" guarantee (it's illegal in Windows/FAT/NTFS
+ * filenames, so it's structurally impossible for a real path, or a display
+ * name StripExt() derived from one, to contain it) while still being a
+ * normal printable character XML has no trouble with.
+ *
+ * Previously PopulateRecentList() called ChangeInterface() + stat() for
+ * every entry on every visit to the tab - up to MAX_RECENT_ROMS device-
+ * interface switches and disk reads, sequentially, each time - which is
+ * what made the tab noticeably slow to open. Caching the two pieces of
+ * data that were actually being fetched (name, size) turns opening the
+ * tab into pure string parsing, no device/disk I/O at all. The one-time
+ * stat() this shifts onto ROM boot is comparatively free - it happens once,
+ * off the critical path of anything the player is waiting on.
+ *
+ * Trade-off: an entry whose file has since been moved/deleted no longer
+ * gets silently filtered out of the list (that required the stat() this
+ * removes) - it'll still show, and selecting it will just fail to load,
+ * same as any other missing-file case elsewhere in the browser.
+ *
+ * Old-format entries from before this change (bare paths, no separator
+ * fields) are still handled - see the fallback in PopulateRecentList()
+ * below - so an existing settings.xml with old-style recent entries
+ * doesn't need to be reset, they just don't have cached name/size until
+ * next time they're re-added to the front of the list.
+ *
+ * BUG FIX: RECENT_FIELD_SEP was ':' on the theory that colon can't appear
+ * in a real path or display name (illegal on FAT/NTFS/Windows). That's
+ * true of the filename itself, but every path in this app is device-
+ * qualified with a colon right up front - "sd:/mgbagx/roms/gb/Foo.gb",
+ * "usb:/...". strchr() finds THAT colon first, not the intended field
+ * separator after the extension, so the split landed in the wrong place:
+ * pathPart truncated to just "sd" (unloadable - selecting the entry did
+ * nothing) while namePart absorbed the rest of the real path (displayed
+ * in the Recent tab instead of a clean name - the "full file locations"
+ * symptom). '*' keeps the same "structurally can't collide" guarantee
+ * (also illegal in FAT/NTFS/Windows filenames) without colliding with the
+ * device prefix scheme, and like ':' needs no XML escaping.
  ***************************************************************************/
+#define RECENT_FIELD_SEP '*'
+
 static int SplitRecentROMs(char *outPaths[MAX_RECENT_ROMS], char *buf, size_t bufSize)
 {
 	snprintf(buf, bufSize, "%s", GCSettings.RecentROMs);
@@ -1189,21 +1267,79 @@ static int SplitRecentROMs(char *outPaths[MAX_RECENT_ROMS], char *buf, size_t bu
 	return count;
 }
 
+// Extracts just the path portion of a (possibly composite) recent-list
+// token, for de-dupe comparisons - a token may be
+// "path<RECENT_FIELD_SEP>name<RECENT_FIELD_SEP>size" (new format) or just
+// "path" (old format/no cached fields yet).
+static void RecentEntryPathOnly(const char *token, char *out, size_t outSize)
+{
+	const char *sep = strchr(token, RECENT_FIELD_SEP);
+	size_t len = sep ? (size_t)(sep - token) : strlen(token);
+	if (len >= outSize) len = outSize - 1;
+	memcpy(out, token, len);
+	out[len] = '\0';
+}
+
+// Extracts just the cached display name portion of a (possibly composite)
+// recent-list token, for de-dupe comparisons - companion to
+// RecentEntryPathOnly() above. Old-format entries (bare path, no cached
+// name yet) fall back to deriving the name from the path the same way
+// PopulateRecentList()/AddRecentROM() do everywhere else, so an old-format
+// duplicate still gets recognized and merged rather than silently missed.
+static void RecentEntryNameOnly(const char *token, char *out, size_t outSize)
+{
+	const char *sep1 = strchr(token, RECENT_FIELD_SEP);
+	if (sep1) {
+		const char *namePart = sep1 + 1;
+		const char *sep2 = strchr(namePart, RECENT_FIELD_SEP);
+		size_t len = sep2 ? (size_t)(sep2 - namePart) : strlen(namePart);
+		if (len >= outSize) len = outSize - 1;
+		memcpy(out, namePart, len);
+		out[len] = '\0';
+		return;
+	}
+	// Old format: derive from the path, same as PopulateRecentList()'s
+	// own fallback.
+	const char *base = strrchr(token, '/');
+	base = base ? base + 1 : token;
+	StripExt(out, base); // StripExt writes into out; caller-sized (MAXJOLIET+1) buffers assumed, same as everywhere else this pattern is used
+}
+
 // Adds fullPath to the front of the recent list, de-duplicating and capping
-// at MAX_RECENT_ROMS entries.
+// at MAX_RECENT_ROMS entries. Computes and caches the display name + file
+// size once here (see the block comment above for why).
 static void AddRecentROM(const char *fullPath)
 {
 	char buf[MAXPATHLEN * MAX_RECENT_ROMS];
 	char *paths[MAX_RECENT_ROMS];
 	int count = SplitRecentROMs(paths, buf, sizeof(buf));
 
+	char displayname[MAXJOLIET + 1];
+	const char *base = strrchr(fullPath, '/');
+	base = base ? base + 1 : fullPath;
+	StripExt(displayname, base);
+
+	long long fileLength = 0;
+	struct stat st;
+	if (stat(fullPath, &st) == 0)
+		fileLength = (long long)st.st_size;
+
 	char newList[MAXPATHLEN * MAX_RECENT_ROMS];
-	int newLen = snprintf(newList, sizeof(newList), "%s", fullPath);
+	int newLen = snprintf(newList, sizeof(newList), "%s%c%s%c%lld",
+		fullPath, RECENT_FIELD_SEP, displayname, RECENT_FIELD_SEP, fileLength);
 	int total = 1;
 
 	for (int i = 0; i < count && total < MAX_RECENT_ROMS; i++) {
-		if (strcasecmp(paths[i], fullPath) == 0)
-			continue; // de-dupe - fullPath is already at the front above
+		char existingPath[MAXPATHLEN];
+		char existingName[MAXJOLIET + 1];
+		RecentEntryPathOnly(paths[i], existingPath, sizeof(existingPath));
+		RecentEntryNameOnly(paths[i], existingName, sizeof(existingName));
+		if (strcasecmp(existingPath, fullPath) == 0 ||
+		    strcasecmp(existingName, displayname) == 0)
+			continue; // de-dupe (by path OR by name) - fullPath is already at the front above
+
+		// Re-emit the existing token as-is (whatever fields it already has,
+		// old or new format) - no need to touch entries we're not adding.
 		int added = snprintf(newList + newLen, sizeof(newList) - newLen, "|%s", paths[i]);
 		if (added < 0 || added >= (int)(sizeof(newList) - newLen))
 			break; // would overflow - stop here
@@ -1218,12 +1354,14 @@ static void AddRecentROM(const char *fullPath)
 	SavePrefs(SILENT);
 }
 
-// Populates browserList with the recent-games entries that still exist on
-// disk, skipping any that have since been moved/deleted. Each entry's
-// filename field holds its FULL path (not just a bare filename like normal
-// directory listings) since entries can span multiple folders/devices -
-// this is resolved back down to a normal browser.dir + filename pair right
-// before loading (see the Recent-tab handling in MenuGameSelection).
+// Populates browserList with the recent-games entries, purely from the
+// cached path<RECENT_FIELD_SEP>name<RECENT_FIELD_SEP>size fields - see the
+// block comment above for why this no longer touches the disk or switches
+// device interfaces. Each entry's filename field holds its FULL path (not
+// just a bare filename like normal directory listings) since entries can
+// span multiple folders/devices - this is resolved back down to a normal
+// browser.dir + filename pair right before loading (see the Recent-tab
+// handling in MenuGameSelection).
 static void PopulateRecentList()
 {
 	ResetBrowser();
@@ -1233,32 +1371,181 @@ static void PopulateRecentList()
 	char *paths[MAX_RECENT_ROMS];
 	int count = SplitRecentROMs(paths, buf, sizeof(buf));
 
-	int device;
-	struct stat st;
-
 	for (int i = 0; i < count; i++)
 	{
-		// Skip entries whose file no longer exists (moved/deleted since
-		// last played) rather than showing dead links.
-		if (!FindDevice(paths[i], &device) || !ChangeInterface(device, NOTSILENT))
-			continue;
-		if (stat(paths[i], &st) != 0)
-			continue;
+		char *token = paths[i];
 
-		const char *base = strrchr(paths[i], '/');
-		base = base ? base + 1 : paths[i];
-		if (base[0] == '\0')
+		// Split "path<RECENT_FIELD_SEP>name<RECENT_FIELD_SEP>size" in
+		// place. Old-format entries (just a bare path, no separator) fall
+		// through with namePart/lenPart left NULL.
+		char *pathPart = token;
+		char *namePart = NULL;
+		char *lenPart = NULL;
+		char *sep1 = strchr(token, RECENT_FIELD_SEP);
+		if (sep1) {
+			*sep1 = '\0';
+			namePart = sep1 + 1;
+			char *sep2 = strchr(namePart, RECENT_FIELD_SEP);
+			if (sep2) {
+				*sep2 = '\0';
+				lenPart = sep2 + 1;
+			}
+		}
+
+		if (pathPart[0] == '\0')
 			continue;
 
 		if (!AddBrowserEntry())
 			break; // out of browser slots
 
 		int idx = browser.numEntries;
-		snprintf(browserList[idx].filename, MAXJOLIET, "%s", paths[i]); // full path
-		StripExt(browserList[idx].displayname, base);
+		snprintf(browserList[idx].filename, MAXJOLIET, "%s", pathPart); // full path
+
+		if (namePart && namePart[0] != '\0') {
+			snprintf(browserList[idx].displayname, sizeof(browserList[idx].displayname), "%s", namePart);
+		} else {
+			// Old-format entry with no cached name yet - fall back to
+			// deriving it from the path, same as this function always did.
+			const char *base = strrchr(pathPart, '/');
+			base = base ? base + 1 : pathPart;
+			StripExt(browserList[idx].displayname, base);
+		}
+
 		browserList[idx].isdir = 0;
 		browserList[idx].icon = ICON_NONE;
-		browserList[idx].length = st.st_size;
+		browserList[idx].length = lenPart ? (u64)strtoull(lenPart, NULL, 10) : 0;
+		browser.numEntries++;
+	}
+}
+
+// Classic (non-tabbed) mode used to just show whatever GCSettings.LoadFolder
+// currently pointed at (manual single-folder navigation, VBA-GX style).
+// This instead merges the top-level contents of all three configured ROM
+// folders (GBFolder/GBCFolder/GBAFolder) into one flat list - same request
+// as the tab strip minus the tabs. Entries store their FULL device-
+// qualified path directly in filename, exactly like PopulateRecentList()
+// above (for the same reason: entries here span more than one folder), and
+// are resolved back down to a normal browser.dir + filename pair right
+// before loading (see the ClassicBrowser handling in MenuGameSelection,
+// which now shares that resolution with the Recent tab).
+//
+// Non-recursive - only the top level of each folder is scanned, same as
+// each tab already does individually. A missing/unmounted folder is just
+// skipped rather than aborting the whole scan, so e.g. an empty GBCFolder
+// doesn't prevent GB/GBA entries from showing.
+// One flattened ROM entry for Classic mode's combined list - see
+// PopulateClassicCombinedList()/ScanFolderRecursive() below.
+struct CombinedEntry {
+	char fullpath[MAXPATHLEN];
+	char displayname[MAXJOLIET + 1];
+	u64  length;
+};
+
+// Recursively scans dirPath (and everything under it) into combined.
+// relPath is the path so far, relative to whichever of GBFolder/GBCFolder/
+// GBAFolder this walk started at - "" at the top level, "Subfolder/" one
+// level down, etc. - used only to prefix nested files' display names so
+// two identically-named ROMs in different subfolders (impossible in the
+// old flat, non-recursive version, but now very possible) don't show up as
+// indistinguishable duplicate entries in the list.
+//
+// browser.dir/browserList are shared globals that get overwritten by every
+// ParseDirectory() call, including the recursive ones this makes into
+// subfolders - so each level's entries are copied out to a local buffer
+// before recursing into any of that level's subfolders, the same reasoning
+// PopulateRecentList() above uses for why full paths get captured before
+// browserList can be reset out from under them.
+static void ScanFolderRecursive(const char *dirPath, const char *relPath, std::vector<CombinedEntry> &combined, int depth)
+{
+	if (depth > 8)
+		return; // sane recursion cap - not a realistic ROM folder structure past this, just a safety net
+
+	snprintf(browser.dir, sizeof(browser.dir), "%s", dirPath);
+
+	ResetBrowser();
+	ParseDirectory(true, true); // true,true (not false like the old flat scan) - need directory entries back too, to recurse into them
+
+	// Copy this level's entries out before any recursive call below can
+	// overwrite browserList out from under us.
+	struct SubEntry {
+		char name[MAXJOLIET + 1];
+		char displayname[MAXJOLIET + 1];
+		bool isdir;
+		u64  length;
+	};
+	int numEntries = browser.numEntries;
+	std::vector<SubEntry> entries(numEntries);
+	for (int i = 0; i < numEntries; i++)
+	{
+		snprintf(entries[i].name, sizeof(entries[i].name), "%s", browserList[i].filename);
+		snprintf(entries[i].displayname, sizeof(entries[i].displayname), "%s", browserList[i].displayname);
+		entries[i].isdir = browserList[i].isdir;
+		entries[i].length = browserList[i].length;
+	}
+
+	for (int i = 0; i < numEntries; i++)
+	{
+		if (entries[i].isdir)
+		{
+			if (strcmp(entries[i].name, ".") == 0 || strcmp(entries[i].name, "..") == 0)
+				continue; // don't recurse into self/parent - would loop forever on ".."
+
+			char subDir[MAXPATHLEN];
+			char subRel[MAXPATHLEN];
+			snprintf(subDir, sizeof(subDir), "%s%s/", dirPath, entries[i].name);
+			snprintf(subRel, sizeof(subRel), "%s%s/", relPath, entries[i].name);
+			ScanFolderRecursive(subDir, subRel, combined, depth + 1);
+			continue;
+		}
+
+		CombinedEntry e;
+		snprintf(e.fullpath, sizeof(e.fullpath), "%s%s", dirPath, entries[i].name);
+		if (relPath[0] != '\0')
+			snprintf(e.displayname, sizeof(e.displayname), "%s%s", relPath, entries[i].displayname);
+		else
+			snprintf(e.displayname, sizeof(e.displayname), "%s", entries[i].displayname);
+		e.length = entries[i].length;
+		combined.push_back(e);
+	}
+}
+
+static void PopulateClassicCombinedList()
+{
+	std::vector<CombinedEntry> combined;
+
+	const char *folders[3] = { GCSettings.GBFolder, GCSettings.GBCFolder, GCSettings.GBAFolder };
+
+	if (GCSettings.LoadMethod > 0 && ChangeInterface(GCSettings.LoadMethod, NOTSILENT))
+	{
+		for (int f = 0; f < 3; f++)
+		{
+			char topDir[MAXPATHLEN];
+			snprintf(topDir, sizeof(topDir), "%s%s/", pathPrefix[GCSettings.LoadMethod], folders[f]);
+			ScanFolderRecursive(topDir, "", combined, 0);
+		}
+	}
+
+	// Sort across ALL three folders together by display name, not grouped
+	// by which folder each entry came from - the whole point of Classic
+	// mode showing a combined list is a single continuous A-Z, not GB's
+	// A-Z followed by GBC's A-Z followed by GBA's A-Z.
+	std::sort(combined.begin(), combined.end(), [](const CombinedEntry &a, const CombinedEntry &b) {
+		return strcasecmp(a.displayname, b.displayname) < 0;
+	});
+
+	ResetBrowser();
+	browser.dir[0] = 0;
+	for (size_t i = 0; i < combined.size(); i++)
+	{
+		if (!AddBrowserEntry())
+			break; // out of browser slots
+
+		int idx = browser.numEntries;
+		snprintf(browserList[idx].filename, MAXJOLIET, "%s", combined[i].fullpath);
+		snprintf(browserList[idx].displayname, sizeof(browserList[idx].displayname), "%s", combined[i].displayname);
+		browserList[idx].isdir = 0;
+		browserList[idx].icon = ICON_NONE;
+		browserList[idx].length = combined[i].length;
 		browser.numEntries++;
 	}
 }
@@ -1301,6 +1588,76 @@ static int MenuGameSelection()
 	};
 	static const int kNumFolderTabs = 3;
 	static const int kNumTabs = 4;
+
+	// Tab-list cache: GB/GBC/GBA's root-folder scan is otherwise the ~1
+	// second stall switching tabs mid-session, same underlying cost
+	// PopulateRecentList() used to pay per-entry and now doesn't - here the
+	// cost is one real ParseDirectory() disk scan per tab instead of one
+	// stat() per Recent entry, but the fix is the same shape: do the real
+	// scan once, cache it, reuse the cache on every later visit to that
+	// tab instead of re-scanning.
+	//
+	// Deliberately scoped to just each tab's ROOT listing - clicking into a
+	// subfolder within a tab still does a live BrowserChangeFolder() scan
+	// as before, uncached, and switching tabs has always reset back to the
+	// tab's root (not wherever you last navigated within it), which this
+	// preserves rather than changes.
+	//
+	// Not invalidated once populated - there's no realistic way for the SD/
+	// USB device's contents to change out from under a running session on
+	// real hardware, same assumption PopulateRecentList()'s caching above
+	// already makes.
+	struct TabCacheEntry {
+		char filename[MAXJOLIET + 1];
+		char displayname[MAXJOLIET + 1];
+		bool isdir;
+		int  icon;
+		u64  length;
+	};
+	static std::vector<TabCacheEntry> tabCache[3]; // indexed by TAB_GB/TAB_GBC/TAB_GBA
+	static char tabCacheDir[3][MAXPATHLEN];
+	static bool tabCacheValid[3] = { false, false, false };
+
+	auto PopulateTabList = [&](int t) {
+		snprintf(GCSettings.LoadFolder, MAXPATHLEN, "%s", kTabFolders[t]);
+
+		if (tabCacheValid[t])
+		{
+			ResetBrowser();
+			snprintf(browser.dir, sizeof(browser.dir), "%s", tabCacheDir[t]);
+			for (size_t i = 0; i < tabCache[t].size(); i++)
+			{
+				if (!AddBrowserEntry())
+					break; // out of browser slots
+				int idx = browser.numEntries;
+				snprintf(browserList[idx].filename, MAXJOLIET, "%s", tabCache[t][i].filename);
+				snprintf(browserList[idx].displayname, sizeof(browserList[idx].displayname), "%s", tabCache[t][i].displayname);
+				browserList[idx].isdir = tabCache[t][i].isdir;
+				browserList[idx].icon = tabCache[t][i].icon;
+				browserList[idx].length = tabCache[t][i].length;
+				browser.numEntries++;
+			}
+			return;
+		}
+
+		OpenGameList();
+
+		tabCache[t].clear();
+		tabCache[t].reserve(browser.numEntries);
+		for (int i = 0; i < browser.numEntries; i++)
+		{
+			TabCacheEntry e;
+			snprintf(e.filename, sizeof(e.filename), "%s", browserList[i].filename);
+			snprintf(e.displayname, sizeof(e.displayname), "%s", browserList[i].displayname);
+			e.isdir = browserList[i].isdir;
+			e.icon = browserList[i].icon;
+			e.length = browserList[i].length;
+			tabCache[t].push_back(e);
+		}
+		snprintf(tabCacheDir[t], sizeof(tabCacheDir[t]), "%s", browser.dir);
+		tabCacheValid[t] = true;
+	};
+
 	static bool restoredTabOnce = false;
 	static int activeTab = (GCSettings.LastActiveTab >= 0 && GCSettings.LastActiveTab < kNumTabs)
 		? GCSettings.LastActiveTab : 2; // default GBA if unset/out of range
@@ -1513,11 +1870,11 @@ static int MenuGameSelection()
 	// populate initial directory listing
 	selectLoadedFile = 1;
 	if (GCSettings.ClassicBrowser)
-		OpenGameList();
+		PopulateClassicCombinedList();
 	else if (activeTab == TAB_RECENT)
 		PopulateRecentList();
 	else
-		OpenGameList();
+		PopulateTabList(activeTab);
 
 	gameBrowser.ResetState();
 	{
@@ -1567,8 +1924,7 @@ static int MenuGameSelection()
 		if (activeTab == TAB_RECENT) {
 			PopulateRecentList();
 		} else {
-			snprintf(GCSettings.LoadFolder, MAXPATHLEN, "%s", kTabFolders[activeTab]);
-			OpenGameList();
+			PopulateTabList(activeTab);
 		}
 		gameBrowser.ResetState();
 		if (browser.numEntries > 0)
@@ -1655,11 +2011,12 @@ static int MenuGameSelection()
 					// below wipes browserList via ResetBrowser(), so this has
 					// to happen first.
 					char recentFullPath[MAXPATHLEN];
-					if (activeTab == TAB_RECENT)
+					if (activeTab == TAB_RECENT || GCSettings.ClassicBrowser)
 					{
-						// Recent-tab entries store their full device-qualified
-						// path directly in filename (they can each live in a
-						// different folder, unlike a normal directory listing).
+						// Recent-tab and Classic-combined-list entries both
+						// store their full device-qualified path directly in
+						// filename (they can each live in a different
+						// folder, unlike a normal single-directory listing).
 						snprintf(recentFullPath, MAXPATHLEN, "%s", browserList[browser.selIndex].filename);
 
 						// Re-stage browser.dir/browserList[0] to look like a
@@ -2511,54 +2868,63 @@ static int MenuGameSaves(int action)
 
 	memset(&saves, 0, sizeof(saves));
 
-	sprintf(browser.dir, "%s%s", pathPrefix[GCSettings.SaveMethod], GCSettings.SaveFolder);
-	ParseDirectory(true, false);
-
 	len = strlen(ROMFilename);
 
 	// find matching files
 	AllocSaveBuffer();
 
-	for(i=0; i < browser.numEntries; i++)
+	// Two passes: SaveFolder for .sav, StateFolder for .sgm + its preview
+	// .png (they used to be the same folder - see MakeFilePath() in
+	// filebrowser.cpp for where they actually diverge now). Both passes
+	// share the same `saves`/j accumulator, same as when this was one scan.
+	const char *scanFolders[2] = { GCSettings.SaveFolder, GCSettings.StateFolder };
+
+	for (int pass = 0; pass < 2; pass++)
 	{
-		len2 = strlen(browserList[i].filename);
+		sprintf(browser.dir, "%s%s", pathPrefix[GCSettings.SaveMethod], scanFolders[pass]);
+		ParseDirectory(true, false);
 
-		if(len2 < 6 || len2-len < 5)
-			continue;
-
-		if(strncmp(&browserList[i].filename[len2-4], ".sav", 4) == 0)
-			type = FILE_SRAM;
-		else if(strncmp(&browserList[i].filename[len2-4], ".sgm", 4) == 0)
-			type = FILE_SNAPSHOT;
-		else
-			continue;
-
-		strcpy(tmp, browserList[i].filename);
-		tmp[len2-4] = 0;
-		n = FindGameSaveNum(tmp, method);
-
-		if(n >= 0)
+		for(i=0; i < browser.numEntries; i++)
 		{
-			saves.type[j] = type;
-			saves.files[saves.type[j]][n] = 1;
-			strcpy(saves.filename[j], browserList[i].filename);
+			len2 = strlen(browserList[i].filename);
 
-			if(saves.type[j] == FILE_SNAPSHOT)
-			{
-				sprintf(scrfile, "%s%s/%s.png", pathPrefix[GCSettings.SaveMethod], GCSettings.SaveFolder, tmp);
+			if(len2 < 6 || len2-len < 5)
+				continue;
 
-				memset(savebuffer, 0, SAVEBUFFERSIZE);
-				if(LoadFile(scrfile, SILENT))
-					saves.previewImg[j] = new GuiImageData(savebuffer, 64, 48);
-			}
-			snprintf(filepath, 1024, "%s%s/%s", pathPrefix[GCSettings.SaveMethod], GCSettings.SaveFolder, saves.filename[j]);
-			if (stat(filepath, &filestat) == 0)
+			if(strncmp(&browserList[i].filename[len2-4], ".sav", 4) == 0)
+				type = FILE_SRAM;
+			else if(strncmp(&browserList[i].filename[len2-4], ".sgm", 4) == 0)
+				type = FILE_SNAPSHOT;
+			else
+				continue;
+
+			strcpy(tmp, browserList[i].filename);
+			tmp[len2-4] = 0;
+			n = FindGameSaveNum(tmp, method);
+
+			if(n >= 0)
 			{
-				timeinfo = localtime(&filestat.st_mtime);
-				strftime(saves.date[j], 20, "%a %b %d", timeinfo);
-				strftime(saves.time[j], 10, "%I:%M %p", timeinfo);
+				saves.type[j] = type;
+				saves.files[saves.type[j]][n] = 1;
+				strcpy(saves.filename[j], browserList[i].filename);
+
+				if(saves.type[j] == FILE_SNAPSHOT)
+				{
+					sprintf(scrfile, "%s%s/%s.png", pathPrefix[GCSettings.SaveMethod], GCSettings.StateFolder, tmp);
+
+					memset(savebuffer, 0, SAVEBUFFERSIZE);
+					if(LoadFile(scrfile, SILENT))
+						saves.previewImg[j] = new GuiImageData(savebuffer, 64, 48);
+				}
+				snprintf(filepath, 1024, "%s%s/%s", pathPrefix[GCSettings.SaveMethod], scanFolders[pass], saves.filename[j]);
+				if (stat(filepath, &filestat) == 0)
+				{
+					timeinfo = localtime(&filestat.st_mtime);
+					strftime(saves.date[j], 20, "%a %b %d", timeinfo);
+					strftime(saves.time[j], 10, "%I:%M %p", timeinfo);
+				}
+				++j;
 			}
-			++j;
 		}
 	}
 
@@ -3551,6 +3917,20 @@ static void ScreenZoomWindowUpdate(void * ptr, float h, float v)
 		{
 			GCSettings.gbaZoomHor += h;
 			GCSettings.gbaZoomVert += v;
+
+			// Mirrors FixInvalidSettings()'s own gbaZoomHor/gbaZoomVert range
+			// (preferences.cpp) - without this, zoom can be pushed past
+			// [0.5, 1.6] here, display fine for the rest of this session,
+			// and then get silently reset to 1.0 by FixInvalidSettings() the
+			// moment SavePrefs() runs (every time this screen's Back button
+			// is pressed), discarding whatever the user actually set. Same
+			// clamp-on-every-click pattern ScreenPositionWindowUpdate()
+			// already uses for xshift/yshift, just below.
+			if(!(GCSettings.gbaZoomHor >= 0.5 && GCSettings.gbaZoomHor <= 1.6))
+				GCSettings.gbaZoomHor = 1.0;
+			if(!(GCSettings.gbaZoomVert >= 0.5 && GCSettings.gbaZoomVert <= 1.6))
+				GCSettings.gbaZoomVert = 1.0;
+
 			sprintf(zoom, "%.2f%%", GCSettings.gbaZoomHor*100);
 			sprintf(zoom2, "%.2f%%", GCSettings.gbaZoomVert*100);
 		}
@@ -3558,6 +3938,12 @@ static void ScreenZoomWindowUpdate(void * ptr, float h, float v)
 		{
 			GCSettings.gbZoomHor += h;
 			GCSettings.gbZoomVert += v;
+
+			if(!(GCSettings.gbZoomHor >= 0.5 && GCSettings.gbZoomHor <= 1.6))
+				GCSettings.gbZoomHor = 1.0;
+			if(!(GCSettings.gbZoomVert >= 0.5 && GCSettings.gbZoomVert <= 1.6))
+				GCSettings.gbZoomVert = 1.0;
+
 			sprintf(zoom, "%.2f%%", GCSettings.gbZoomHor*100);
 			sprintf(zoom2, "%.2f%%", GCSettings.gbZoomVert*100);
 		}
@@ -3882,6 +4268,13 @@ static int MenuSettingsVideo()
 	}
 	idxInterframeBlending = i;
 	sprintf(options.name[i++], "Interframe Blending");
+	// Moved here from the pre-game Emulation settings menu, which isn't
+	// reachable during gameplay - Frameskip is exactly the kind of thing
+	// you want to be able to flip on/off in response to what's actually
+	// happening on screen (e.g. a busy scene bogging down), not something
+	// you'd only ever set once before starting.
+	int idxFrameskip = i;
+	sprintf(options.name[i++], "Frameskip");
 	options.length = i;
 
 	for(i=0; i < options.length; i++)
@@ -4009,6 +4402,10 @@ static int MenuSettingsVideo()
 					}
 				} else if (ret >= 0 && ret == idxInterframeBlending) {
 					GCSettings.InterframeBlending = !GCSettings.InterframeBlending;
+				} else if (ret >= 0 && ret == idxFrameskip) {
+					GCSettings.Frameskip++;
+					if (GCSettings.Frameskip > 4)
+						GCSettings.Frameskip = 0;
 				}
 				break;
 		}
@@ -4102,7 +4499,8 @@ static int MenuSettingsVideo()
 			if (idxFilterMethod >= 0) {
 				sprintf (options.value[idxFilterMethod], "%s",
 					GCSettings.FilterMethod == FILTER_SCANLINES ? "Scanlines" :
-					GCSettings.FilterMethod == FILTER_SCALE2X ? "Scale2x" : "None");
+					GCSettings.FilterMethod == FILTER_SCALE2X ? "Scale2x" :
+					GCSettings.FilterMethod == FILTER_SHARP_BILINEAR ? "Sharp Bilinear" : "None");
 			}
 
 			// Takes effect immediately, live, on the next rendered frame -
@@ -4132,6 +4530,11 @@ static int MenuSettingsVideo()
 				sprintf (options.value[idxInterframeBlending], "%s",
 					GCSettings.InterframeBlending ? "On" : "Off");
 			}
+
+			if (GCSettings.Frameskip == 0)
+				sprintf (options.value[idxFrameskip], "Off");
+			else
+				sprintf (options.value[idxFrameskip], "%d", GCSettings.Frameskip);
 
 			optionBrowser.TriggerUpdate();
 		}
@@ -4925,6 +5328,7 @@ static int MenuSettingsFile()
 	sprintf(options.name[i++], "Load Device");
 	sprintf(options.name[i++], "Save Device");
 	sprintf(options.name[i++], "Save Folder");
+	sprintf(options.name[i++], "State Folder");
 	sprintf(options.name[i++], "GB Folder");
 	sprintf(options.name[i++], "GBC Folder");
 	sprintf(options.name[i++], "GBA Folder");
@@ -4936,7 +5340,12 @@ static int MenuSettingsFile()
 	sprintf(options.name[i++], "Cheats Folder");
 	sprintf(options.name[i++], "Auto Load");
 	sprintf(options.name[i++], "Auto Save");
-	sprintf(options.name[i++], "Append Auto to .SAV Files");
+	// Applies to both the .sav (SRAM) AND .sgm (save state) auto-save slot,
+	// not just .sav files - see the switch case below and its comment.
+	// Shortened from "Append 'Auto' to Auto-Save Filenames" (36 chars) -
+	// every other label in this list tops out at 18 chars ("Screenshots
+	// Folder"), and the long version overlapped the On/Off value column.
+	sprintf(options.name[i++], "Auto-Save Suffix");
 	options.length = i;
 
 	for(i=0; i < options.length; i++)
@@ -5000,54 +5409,58 @@ static int MenuSettingsFile()
 				break;
 
 			case 3:
-				OnScreenKeyboard(GCSettings.GBFolder, MAXPATHLEN);
+				OnScreenKeyboard(GCSettings.StateFolder, MAXPATHLEN);
 				break;
 
 			case 4:
-				OnScreenKeyboard(GCSettings.GBCFolder, MAXPATHLEN);
+				OnScreenKeyboard(GCSettings.GBFolder, MAXPATHLEN);
 				break;
 
 			case 5:
-				OnScreenKeyboard(GCSettings.GBAFolder, MAXPATHLEN);
+				OnScreenKeyboard(GCSettings.GBCFolder, MAXPATHLEN);
 				break;
 
 			case 6:
-				OnScreenKeyboard(GCSettings.ScreenshotsFolder, MAXPATHLEN);
+				OnScreenKeyboard(GCSettings.GBAFolder, MAXPATHLEN);
 				break;
 
 			case 7:
-				OnScreenKeyboard(GCSettings.CoverFolder, MAXPATHLEN);
+				OnScreenKeyboard(GCSettings.ScreenshotsFolder, MAXPATHLEN);
 				break;
 
 			case 8:
+				OnScreenKeyboard(GCSettings.CoverFolder, MAXPATHLEN);
+				break;
+
+			case 9:
 				OnScreenKeyboard(GCSettings.ArtworkFolder, MAXPATHLEN);
 				break;
 			
-			case 9:
+			case 10:
 				OnScreenKeyboard(GCSettings.GBABorderFolder, MAXPATHLEN);
 				break;
 
-			case 10:
+			case 11:
 				OnScreenKeyboard(GCSettings.GBCBorderFolder, MAXPATHLEN);
 				break;
 
-			case 11:
+			case 12:
 				OnScreenKeyboard(GCSettings.CheatFolder, MAXPATHLEN);
 				break;
 
-			case 12:
+			case 13:
 				GCSettings.AutoLoad++;
 				if (GCSettings.AutoLoad > 2)
 					GCSettings.AutoLoad = 0;
 				break;
 
-			case 13:
+			case 14:
 				GCSettings.AutoSave++;
 				if (GCSettings.AutoSave > 3)
 					GCSettings.AutoSave = 0;
 				break;
 
-			case 14:
+			case 15:
 				GCSettings.AppendAuto++;
 				if (GCSettings.AppendAuto > 1)
 					GCSettings.AppendAuto = 0;
@@ -5127,27 +5540,28 @@ static int MenuSettingsFile()
 			else if (GCSettings.SaveMethod == DEVICE_SD_GCLOADER) sprintf (options.value[1],"GC Loader");
 
 			snprintf (options.value[2], 35, "%s", GCSettings.SaveFolder);
-			snprintf (options.value[3], 35, "%s", GCSettings.GBFolder);
-			snprintf (options.value[4], 35, "%s", GCSettings.GBCFolder);
-			snprintf (options.value[5], 35, "%s", GCSettings.GBAFolder);
-			snprintf (options.value[6], 35, "%s", GCSettings.ScreenshotsFolder);
-			snprintf (options.value[7], 35, "%s", GCSettings.CoverFolder);
-			snprintf (options.value[8], 35, "%s", GCSettings.ArtworkFolder);
-			snprintf (options.value[9], 35, "%s", GCSettings.GBABorderFolder);
-			snprintf (options.value[10], 35, "%s", GCSettings.GBCBorderFolder);
-			snprintf (options.value[11], 35, "%s", GCSettings.CheatFolder);
+			snprintf (options.value[3], 35, "%s", GCSettings.StateFolder);
+			snprintf (options.value[4], 35, "%s", GCSettings.GBFolder);
+			snprintf (options.value[5], 35, "%s", GCSettings.GBCFolder);
+			snprintf (options.value[6], 35, "%s", GCSettings.GBAFolder);
+			snprintf (options.value[7], 35, "%s", GCSettings.ScreenshotsFolder);
+			snprintf (options.value[8], 35, "%s", GCSettings.CoverFolder);
+			snprintf (options.value[9], 35, "%s", GCSettings.ArtworkFolder);
+			snprintf (options.value[10], 35, "%s", GCSettings.GBABorderFolder);
+			snprintf (options.value[11], 35, "%s", GCSettings.GBCBorderFolder);
+			snprintf (options.value[12], 35, "%s", GCSettings.CheatFolder);
 
-			if (GCSettings.AutoLoad == 0) sprintf (options.value[12],"Off");
-			else if (GCSettings.AutoLoad == 1) sprintf (options.value[12],"SRAM");
-			else if (GCSettings.AutoLoad == 2) sprintf (options.value[12],"State");
+			if (GCSettings.AutoLoad == 0) sprintf (options.value[13],"Off");
+			else if (GCSettings.AutoLoad == 1) sprintf (options.value[13],"SRAM");
+			else if (GCSettings.AutoLoad == 2) sprintf (options.value[13],"State");
 
-			if (GCSettings.AutoSave == 0) sprintf (options.value[13],"Off");
-			else if (GCSettings.AutoSave == 1) sprintf (options.value[13],"SRAM");
-			else if (GCSettings.AutoSave == 2) sprintf (options.value[13],"State");
-			else if (GCSettings.AutoSave == 3) sprintf (options.value[13],"Both");
+			if (GCSettings.AutoSave == 0) sprintf (options.value[14],"Off");
+			else if (GCSettings.AutoSave == 1) sprintf (options.value[14],"SRAM");
+			else if (GCSettings.AutoSave == 2) sprintf (options.value[14],"State");
+			else if (GCSettings.AutoSave == 3) sprintf (options.value[14],"Both");
 
-			if (GCSettings.AppendAuto == 0) sprintf (options.value[14],"Off");
-			else if (GCSettings.AppendAuto == 1) sprintf (options.value[14],"On");
+			if (GCSettings.AppendAuto == 0) sprintf (options.value[15],"Off");
+			else if (GCSettings.AppendAuto == 1) sprintf (options.value[15],"On");
 
 			optionBrowser.TriggerUpdate();
 		}
