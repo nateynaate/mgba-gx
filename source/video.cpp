@@ -21,6 +21,7 @@
 #include "menu.h"
 #include "input.h"
 #include "vbasupport.h"
+#include "videofilters.h"
 
 s32 CursorX, CursorY;
 bool CursorVisible;
@@ -58,44 +59,50 @@ static volatile unsigned int copynow = GX_FALSE;
 #define TEXTUREMEM_SIZE 	TEX_WIDTH*TEX_HEIGHT*2
 static u8 texturemem[TEXTUREMEM_SIZE] ATTRIBUTE_ALIGN (32);
 
-// Scanline filter: an 8x4 I8 (one byte per pixel) repeating tile, rows
-// alternating full brightness / darkened, sampled via GX_REPEAT and
-// multiplied against the game texture in a second TEV stage (see
-// configure_tev_pipeline() below). Ported from VBA-GX 3.0.0's
-// InitScanlineTexture()/SetupScanlineFilterTEV() - this is real GX
-// hardware work (one extra texture sample + multiply per pixel), not a
-// CPU pixel loop, so it's effectively free compared to any of the CPU-side
-// scaling filters in the same upstream release.
-static unsigned char scanline_tex_data[32] ATTRIBUTE_ALIGN(32);
-static GXTexObj scanlineTexObj;
-static bool scanlineTexInited = false;
+// Scanline filter (FILTER_SCANLINES) - GX-native tiled-texture-multiply
+// technique, actual data/texture setup now lives in videofilters.cpp/h
+// (EnsureScanlineTexture(), scanlineTexObj) - see there for details. Used
+// below in configure_tev_pipeline().
 
 static GXTexObj texobj;
 static Mtx view;
 static int vwidth, vheight;
+
+// Round-half-away-from-zero to int, used below wherever a computed EFB
+// position/size gets stored into an int (realVX/Y/W/H, liveVX/Y/W/H) -
+// plain (int) truncation always rounds toward zero, so a value like 78.5
+// silently became 78 instead of the nearer 79. GX_SetViewport() itself
+// still gets the precise float either way (this only affects the stored
+// copies), but TakeScreenshot() and the pause-screen blur compositor
+// (menu.cpp's BuildBlurredPauseScreen()) both position themselves off
+// these stored ints, so the lost half-pixel was a real, if small, source
+// of misalignment in both.
+static inline int RoundToInt(float x)
+{
+	return (x >= 0.0f) ? (int)(x + 0.5f) : (int)(x - 0.5f);
+}
 static int updateScaling;
 
 // Sharp Bilinear filter (FILTER_SHARP_BILINEAR - see vbagx.h): a nearest-
-// neighbor integer prescale of the raw game texture, rendered to this
-// scratch texture, which is then sampled with real bilinear filtering for
-// the final on-screen quad in GX_Render() below. See
-// RenderSharpBilinearPrescale() for the actual two-pass implementation and
-// why this needs two passes instead of one shader (GX has no programmable
-// shader stage to do it in one, unlike RetroArch's sharp-bilinear.slangp).
+// neighbor integer prescale of the raw game texture, rendered to a scratch
+// texture, which is then sampled with real bilinear filtering for the
+// final on-screen quad in GX_Render() below. The scratch texture
+// (sharpBilinearTexMem/sharpBilinearTexObj) and the prescale-size math now
+// live in videofilters.cpp/h - see RenderSharpBilinearPrescale() below for
+// the actual two-pass draw implementation and why this needs two passes
+// instead of one shader (GX has no programmable shader stage to do it in
+// one, unlike RetroArch's sharp-bilinear.slangp).
 //
-// Sized for the largest input this filter is ever applied to (GBA's
-// 240x160, gated in GX_Render() below) at SHARP_BILINEAR_PRESCALE - not
-// SGB-bordered content, which this filter is intentionally scoped off for
-// (same restriction Scale2x already has, for the same reason: correctly
-// compositing a prescaled game image into a non-prescaled border isn't
-// handled here).
-#define SHARP_BILINEAR_PRESCALE 2
-#define SHARP_BILINEAR_MAX_W (240 * SHARP_BILINEAR_PRESCALE)
-#define SHARP_BILINEAR_MAX_H (160 * SHARP_BILINEAR_PRESCALE)
-static u8 sharpBilinearTexMem[SHARP_BILINEAR_MAX_W * SHARP_BILINEAR_MAX_H * 2] ATTRIBUTE_ALIGN(32);
-static GXTexObj sharpBilinearTexObj;
-static int sharpBilinearTexW = -1, sharpBilinearTexH = -1;
-static bool sharpBilinearTexInited = false;
+// The prescale factor is computed dynamically, per-frame, from the real
+// final on-screen size (liveVW/liveVH) instead of a fixed 2x - a fixed
+// factor left almost nothing for the second (visible, bilinear) pass to
+// do whenever the actual output scale was already close to it, which is
+// exactly why this was reported as looking no different from plain
+// filtering, especially for GB/GBC's smaller 160x144 source where a CRT's
+// full output scale is well past 2x. Not used for SGB-bordered content,
+// which this filter is intentionally scoped off for (same restriction
+// Scale2x already has, for the same reason: correctly compositing a
+// prescaled game image into a non-prescaled border isn't handled here).
 
 // Actual on-screen rectangle the game quad is drawn into (EFB pixel space,
 // including any TV/scanout-only stretch such as the 240p width doubling or
@@ -204,46 +211,54 @@ copy_to_xfb (u32 arg)
 /****************************************************************************
  * Scaler Support Functions
  ****************************************************************************/
-static void InitScanlineTexture()
+// True for any filter that uses the shared 2-stage "multiply the game
+// texture by a small repeating mask texture" TEV setup below (scanlines,
+// LCD grid, LCD RGB) - as opposed to filters handled entirely outside
+// configure_tev_pipeline() (Scale2x, Sharp Bilinear) or no filter at all.
+static inline bool IsMaskFilter(int filterMethod)
 {
-	// 8x4 tile: rows 0/2 full brightness, rows 1/3 darkened - 0xA0 controls
-	// how visible the scanlines are.
-	for (int y = 0; y < 4; y++) {
-		u8 intensity = (y % 2 == 0) ? 0xFF : 0xA0;
-		for (int x = 0; x < 8; x++)
-			scanline_tex_data[y * 8 + x] = intensity;
+	return filterMethod == FILTER_SCANLINES ||
+	       filterMethod == FILTER_LCD_GRID ||
+	       filterMethod == FILTER_LCD_RGB;
+}
+
+// Each mask filter's tile size in texels, needed both to load the right
+// texobj here and to compute the right GX_REPEAT count in draw_square()
+// below - scanlines/LCD grid are 8x4 I8 tiles, LCD RGB is a 4x4 RGB565
+// tile (see videofilters.cpp for why each is sized the way it is).
+static inline void GetMaskFilterTileSize(int filterMethod, int *tileW, int *tileH)
+{
+	if (filterMethod == FILTER_LCD_RGB) {
+		*tileW = 4; *tileH = 4;
+	} else {
+		*tileW = 8; *tileH = 4;
 	}
-
-	// GX reads texture data directly from main memory, not cache - flush
-	// before the GPU ever touches this.
-	DCFlushRange(scanline_tex_data, 32);
-
-	// GX_REPEAT on both axes so this tiles across the whole screen from a
-	// single 8x4 source. GX_NEAR (not GX_LINEAR) is required - linear
-	// filtering blurs the alternating rows into flat gray, defeating the
-	// effect entirely.
-	GX_InitTexObj(&scanlineTexObj, scanline_tex_data, 8, 4, GX_TF_I8, GX_REPEAT, GX_REPEAT, GX_FALSE);
-	GX_InitTexObjFilterMode(&scanlineTexObj, GX_NEAR, GX_NEAR);
-
-	scanlineTexInited = true;
 }
 
 // Switches between our normal single-stage "just show the game texture"
-// TEV setup and a 2-stage setup that multiplies it against the scanline
-// texture. Called both from draw_init() (mode/scale changes) and at the
-// top of every GX_Render() call, since draw_cursor() reconfigures TEV/
-// texgen state for its own draw and this must be reasserted before the
-// next frame's game quad regardless of which path was active last.
+// TEV setup and a 2-stage setup that multiplies it against a mask
+// texture (scanlines, LCD grid, or LCD RGB - see IsMaskFilter() above).
+// Called both from draw_init() (mode/scale changes) and at the top of
+// every GX_Render() call, since draw_cursor() reconfigures TEV/texgen
+// state for its own draw and this must be reasserted before the next
+// frame's game quad regardless of which path was active last.
 static inline void configure_tev_pipeline()
 {
-	if (GCSettings.FilterMethod == FILTER_SCANLINES) {
-		if (!scanlineTexInited)
-			InitScanlineTexture();
-		GX_LoadTexObj(&scanlineTexObj, GX_TEXMAP1);
+	if (IsMaskFilter(GCSettings.FilterMethod)) {
+		if (GCSettings.FilterMethod == FILTER_SCANLINES) {
+			EnsureScanlineTexture();
+			GX_LoadTexObj(&scanlineTexObj, GX_TEXMAP1);
+		} else if (GCSettings.FilterMethod == FILTER_LCD_GRID) {
+			EnsureLCDGridTexture();
+			GX_LoadTexObj(&lcdGridTexObj, GX_TEXMAP1);
+		} else {
+			EnsureLCDRGBTexture();
+			GX_LoadTexObj(&lcdRgbTexObj, GX_TEXMAP1);
+		}
 
 		// Second texcoord stream, direct (not indexed like GX_VA_POS) so
-		// draw_square() can emit per-vertex scanline UVs independent of the
-		// indexed square[] position array.
+		// draw_square() can emit per-vertex mask-texture UVs independent of
+		// the indexed square[] position array.
 		GX_SetVtxDesc(GX_VA_TEX1, GX_DIRECT);
 		GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX1, GX_TEX_ST, GX_F32, 0);
 
@@ -261,7 +276,11 @@ static inline void configure_tev_pipeline()
 		GX_SetTevAlphaIn(GX_TEVSTAGE0, GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO, GX_CA_TEXA);
 		GX_SetTevAlphaOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
 
-		// Stage 1: multiply stage 0's result by the scanline texture.
+		// Stage 1: multiply stage 0's result by the mask texture. Works
+		// identically whether the mask is a monochrome intensity texture
+		// (scanlines/LCD grid, GX_TF_I8 - broadcasts to R=G=B) or a real
+		// color one (LCD RGB, GX_TF_RGB565) - GX_CC_TEXC is just a
+		// per-channel multiply either way.
 		GX_SetTevOrder(GX_TEVSTAGE1, GX_TEXCOORD1, GX_TEXMAP1, GX_COLORNULL);
 		GX_SetTevColorIn(GX_TEVSTAGE1, GX_CC_ZERO, GX_CC_CPREV, GX_CC_TEXC, GX_CC_ZERO);
 		GX_SetTevColorOp(GX_TEVSTAGE1, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
@@ -317,7 +336,8 @@ static inline void draw_vert(u8 pos, f32 s, f32 t)
 // Same as draw_vert, but also emits the second (TEX1) texcoord the
 // scanline texture needs. su/sv are in scanline-texture-tile units (i.e.
 // "how many 8x4 tiles across/down"), not 0..1 - GX_REPEAT wrapping on the
-// scanline texobj (see InitScanlineTexture) tiles it across that range.
+// scanline texobj (see EnsureScanlineTexture, videofilters.cpp) tiles it
+// across that range.
 static inline void draw_vert_scanline(u8 pos, f32 s, f32 t, f32 su, f32 sv)
 {
 	GX_Position1x8(pos);
@@ -345,14 +365,18 @@ static inline void draw_square(Mtx v)
 
 	GX_LoadPosMtxImm(mv, GX_PNMTX0);
 	GX_Begin(GX_QUADS, GX_VTXFMT0, 4);
-	if (GCSettings.FilterMethod == FILTER_SCANLINES) {
-		// Repeat counts sized so each scanline-texture row roughly tracks
-		// one real on-screen pixel row - liveVW/liveVH (set in
-		// UpdateScaling()) is the actual EFB pixel size of the quad,
-		// already accounting for fixed/stretch/240p mode, so this doesn't
-		// need to re-derive the object-space-to-screen transform itself.
-		float repeatX = (liveVW > 0) ? (liveVW / 8.0f) : 1.0f;
-		float repeatY = (liveVH > 0) ? (liveVH / 4.0f) : 1.0f;
+	if (IsMaskFilter(GCSettings.FilterMethod)) {
+		// Repeat counts sized so each mask-texture tile roughly tracks one
+		// real on-screen pixel cell - liveVW/liveVH (set in UpdateScaling())
+		// is the actual EFB pixel size of the quad, already accounting for
+		// fixed/stretch/240p mode, so this doesn't need to re-derive the
+		// object-space-to-screen transform itself. Tile size varies by
+		// filter (GetMaskFilterTileSize() above), so the divisor isn't a
+		// fixed 8x4 anymore.
+		int tileW, tileH;
+		GetMaskFilterTileSize(GCSettings.FilterMethod, &tileW, &tileH);
+		float repeatX = (liveVW > 0) ? (liveVW / (float)tileW) : 1.0f;
+		float repeatY = (liveVH > 0) ? (liveVH / (float)tileH) : 1.0f;
 		draw_vert_scanline(0, 0.0, 0.0, 0.0f,    0.0f);
 		draw_vert_scanline(1, 1.0, 0.0, repeatX, 0.0f);
 		draw_vert_scanline(2, 1.0, 1.0, repeatX, repeatY);
@@ -428,31 +452,35 @@ static inline void draw_square_cropped(Mtx v, float u0, float v0, float u1, floa
  ***************************************************************************/
 static void RenderSharpBilinearPrescale(int borderWidth, int borderHeight)
 {
-	int prescaleW = borderWidth * SHARP_BILINEAR_PRESCALE;
-	int prescaleH = borderHeight * SHARP_BILINEAR_PRESCALE;
-
-	// Clamp to the EFB's actual bounds - 240p mode has a much shorter
-	// efbHeight than standard modes - and to the scratch buffer's fixed
-	// capacity above. Rounded down to a multiple of 4 to stay aligned with
-	// GX's tiled texture format, same as every real game resolution this
-	// filter runs on already naturally is.
-	if (prescaleW > vmode->fbWidth)   prescaleW = vmode->fbWidth;
-	if (prescaleH > vmode->efbHeight) prescaleH = vmode->efbHeight;
-	if (prescaleW > SHARP_BILINEAR_MAX_W) prescaleW = SHARP_BILINEAR_MAX_W;
-	if (prescaleH > SHARP_BILINEAR_MAX_H) prescaleH = SHARP_BILINEAR_MAX_H;
-	prescaleW &= ~3;
-	prescaleH &= ~3;
-	if (prescaleW <= 0 || prescaleH <= 0)
+	// Dynamic prescale factor: the smallest integer scale that gets the
+	// prescaled texture to at least the real final on-screen size in both
+	// dimensions. That guarantees the second, visible bilinear stretch in
+	// the normal draw_square() call afterward always has real room to
+	// smooth pixel edges, instead of being left with almost nothing to do
+	// whenever the real output scale happened to already sit close to a
+	// fixed factor - which on a CRT (full analog TV resolution, no
+	// integer-scale preference) is the common case, especially for GB/GBC's
+	// smaller 160x144 source.
+	//
+	// Deliberately liveVW/liveVH here, NOT realVW/realVH: in non-fixed
+	// (stretch) scaling modes, UpdateScaling() leaves realVW/realVH as the
+	// full GX viewport (640x480) - the viewport itself is always
+	// full-screen in that mode, with the actual quad size/position handled
+	// separately by the vertex transform (see UpdateScaling()'s own
+	// comment on this). Using realVW/realVH here was computing a factor
+	// against the full screen size instead of the real (usually smaller)
+	// drawn quad, over-prescaling the texture - which then made GX_LINEAR
+	// minify it back down without a mip chain to reach the real quad size,
+	// aliasing just as badly as plain nearest would have and making the
+	// filter look like it wasn't doing anything at all. liveVW/liveVH
+	// tracks the real drawn quad's pixel size in every scaling mode.
+	int prescaleW, prescaleH;
+	if (!ComputeSharpBilinearPrescaleSize(borderWidth, borderHeight, liveVW, liveVH,
+	                                       vmode->fbWidth, vmode->efbHeight,
+	                                       &prescaleW, &prescaleH))
 		return; // degenerate - bail out, caller falls back to sampling texobj directly
 
-	if (!sharpBilinearTexInited || prescaleW != sharpBilinearTexW || prescaleH != sharpBilinearTexH)
-	{
-		GX_InitTexObj(&sharpBilinearTexObj, sharpBilinearTexMem, prescaleW, prescaleH, GX_TF_RGB565, GX_CLAMP, GX_CLAMP, GX_FALSE);
-		GX_InitTexObjFilterMode(&sharpBilinearTexObj, GX_LINEAR, GX_LINEAR); // this IS the bilinear step - always on for this texture
-		sharpBilinearTexW = prescaleW;
-		sharpBilinearTexH = prescaleH;
-		sharpBilinearTexInited = true;
-	}
+	EnsureSharpBilinearTexture(prescaleW, prescaleH);
 
 	// Pass 1: point-sample the raw game texture into the top-left corner of
 	// the EFB at the prescaled integer size, regardless of what
@@ -471,6 +499,23 @@ static void RenderSharpBilinearPrescale(int borderWidth, int borderHeight)
 	// doesn't need to fully overdraw this corner itself to avoid leaving a
 	// stray patch of pass-1 pixels visible in this frame's output.
 	GX_CopyTex(sharpBilinearTexMem, GX_TRUE);
+
+	// GX_CopyTex() kicks off the EFB->main-memory copy asynchronously on
+	// real hardware - it does not block until the copy engine has actually
+	// finished writing sharpBilinearTexMem. Dolphin performs the copy
+	// synchronously in its own emulation of this call, so it never exposes
+	// the hazard, but on a real Wii, the caller's very next steps
+	// (GX_InvalidateTexAll() + loading sharpBilinearTexObj into TEXMAP0 for
+	// this same frame's draw_square() call in GX_Render()) can then race
+	// the copy engine and sample a partially-written or stale previous
+	// frame's texture - a real, silent race, not a crash, so it can look
+	// like "the filter does nothing" rather than an obvious glitch.
+	// GX_PixModeSync() blocks until the copy completes, which is exactly
+	// what's needed here since the copy's own destination is read again
+	// within the same frame. This is a no-op on Dolphin (the copy is
+	// already done by the time this runs) so it's safe there too.
+	GX_PixModeSync();
+
 	GX_InvalidateTexAll(); // sharpBilinearTexObj's data just changed on the GPU side - drop any stale cached copy before it's sampled below
 
 	// Restore the real on-screen viewport (computed by UpdateScaling(),
@@ -860,7 +905,7 @@ static inline void UpdateScaling()
 		if (vh > vmode->efbHeight) vh = vmode->efbHeight;
 
 		GX_SetViewport(vx, vy, vw, vh, 0, 1);
-		realVX = (int)vx; realVY = (int)vy; realVW = (int)vw; realVH = (int)vh;
+		realVX = RoundToInt(vx); realVY = RoundToInt(vy); realVW = RoundToInt(vw); realVH = RoundToInt(vh);
 
 		// Same centering math, but against the RAW (pre-240p-hack) size,
 		// for the reasons above.
@@ -871,7 +916,7 @@ static inline void UpdateScaling()
 		if (rawVw > vmode->fbWidth)  rawVw = vmode->fbWidth;
 		if (rawVh > vmode->efbHeight) rawVh = vmode->efbHeight;
 
-		liveVX = (int)rawVx; liveVY = (int)rawVy; liveVW = (int)rawVw; liveVH = (int)rawVh;
+		liveVX = RoundToInt(rawVx); liveVY = RoundToInt(rawVy); liveVW = RoundToInt(rawVw); liveVH = RoundToInt(rawVh);
 
 		// Screenshot output size: always the native console resolution (1x),
 		// completely independent of the live "Fixed Pixel Ratio" zoom
@@ -925,10 +970,10 @@ static inline void UpdateScaling()
 		// on what liveVX/Y/W/H actually mean.
 		float efbScaleX = vmode->fbWidth   / 640.0f;
 		float efbScaleY = vmode->efbHeight / 480.0f;
-		liveVX = (int)((320.0f - xscale + GCSettings.xshift) * efbScaleX);
-		liveVY = (int)((240.0f - yscale + GCSettings.yshift) * efbScaleY);
-		liveVW = (int)(2.0f * xscale * efbScaleX);
-		liveVH = (int)(2.0f * yscale * efbScaleY);
+		liveVX = RoundToInt((320.0f - xscale + GCSettings.xshift) * efbScaleX);
+		liveVY = RoundToInt((240.0f - yscale + GCSettings.yshift) * efbScaleY);
+		liveVW = RoundToInt(2.0f * xscale * efbScaleX);
+		liveVH = RoundToInt(2.0f * yscale * efbScaleY);
 
 		// Screenshot output size: always the native console resolution (1x),
 		// for the same reason as the fixed-mode branch above.
@@ -965,7 +1010,21 @@ ResetVideo_Emu ()
 		GCSettings.render == RENDER_FILTERED_SHARP ? sharp
 		: GCSettings.render == RENDER_FILTERED_SOFT ? soft
 		: rmode->vfilter;
-	GX_SetCopyFilter (rmode->aa, rmode->sample_pattern, (GCSettings.render != RENDER_UNFILTERED) ? GX_TRUE : GX_FALSE, vfilter);	// deflickering filter only for filtered mode
+
+	// Deflicker blends adjacent EFB lines together on the way to the XFB -
+	// worthwhile for general anti-flicker on full-screen antialiased
+	// content, but actively counterproductive for GBA Fixed Pixel Ratio:
+	// that mode draws each source pixel as an exact, fully-covered
+	// integer-multiple block with no fine per-line detail to flicker in
+	// the first place, so this was blurring a perfectly sharp nearest-
+	// scaled image for no benefit. Previously this was tied 1:1 to
+	// GCSettings.render (only off for RENDER_UNFILTERED), which meant
+	// Filtered/Sharp/Soft + Fixed Pixel Ratio still got blurred here even
+	// though FPR's own scaling has nothing for deflicker to help with -
+	// now FPR forces it off regardless of the render filter choice.
+	bool fixedPixelRatioActive = (cartridgeType == CARTRIDGE_GBA) ? (GCSettings.gbaFixed != 0) : (GCSettings.gbFixed != 0);
+	bool useDeflicker = (GCSettings.render != RENDER_UNFILTERED) && !fixedPixelRatioActive;
+	GX_SetCopyFilter (rmode->aa, rmode->sample_pattern, useDeflicker ? GX_TRUE : GX_FALSE, vfilter);
 
 	GX_SetFieldMode (rmode->field_rendering, ((rmode->viHeight == 2 * rmode->xfbHeight) ? GX_ENABLE : GX_DISABLE));
 	
@@ -1285,64 +1344,9 @@ void SwizzleLinearToGXTiled(const u8 *src, u8 *dst, int width, int height, int s
     }
 }
 
-/****************************************************************************
- * Scale2xRGB565
- *
- * Standard Scale2x/AdvMAME2x algorithm (Andrea Mazzoleni,
- * https://www.scale2x.it/, BSD-style license) - doubles a linear RGB565
- * image using simple neighbor-comparison edge detection. No lookup
- * table, cheap per-pixel, safe starting point for a Wii CPU budget.
- *
- * srcStride/dstStride are given in PIXELS (not bytes) and, like mGBA's
- * own framebuffer, are expected to carry the same 2-pixel row padding
- * WriteFrameToTextureMemory's gbPitch (= width*2+4 bytes) already
- * assumes - both this function's input and output keep that padding so
- * the existing swizzle path downstream doesn't need to know anything
- * changed.
- ***************************************************************************/
-static void Scale2xRGB565(const u16 *src, int srcStride, int width, int height, u16 *dst, int dstStride)
-{
-    for (int y = 0; y < height; y++)
-    {
-        const u16 *rowE = src + y * srcStride;
-        const u16 *rowB = src + (y > 0 ? y - 1 : y) * srcStride;
-        const u16 *rowH = src + (y < height - 1 ? y + 1 : y) * srcStride;
-
-        u16 *dst0 = dst + (y * 2) * dstStride;
-        u16 *dst1 = dst + (y * 2 + 1) * dstStride;
-
-        for (int x = 0; x < width; x++)
-        {
-            u16 B = rowB[x];
-            u16 D = rowE[x > 0 ? x - 1 : x];
-            u16 E = rowE[x];
-            u16 F = rowE[x < width - 1 ? x + 1 : x];
-            u16 H = rowH[x];
-
-            u16 E0 = E, E1 = E, E2 = E, E3 = E;
-            if (B != H && D != F)
-            {
-                if (D == B) E0 = D;
-                if (B == F) E1 = F;
-                if (D == H) E2 = D;
-                if (H == F) E3 = F;
-            }
-
-            dst0[x * 2]     = E0;
-            dst0[x * 2 + 1] = E1;
-            dst1[x * 2]     = E2;
-            dst1[x * 2 + 1] = E3;
-        }
-    }
-}
-
-// Scratch buffer for Scale2x output before it gets swizzled into
-// texturemem by the existing WriteFrameToTextureMemory() path below.
-// Sized for the largest supported case (GBA 240x160 doubled to
-// 480x320), with the same 2-pixel row padding WriteFrameToTextureMemory
-// expects: (240*2+2 pixels) * 2 bytes * (160*2) rows.
-#define SCALE2X_BUF_SIZE ((240 * 2 + 2) * (160 * 2) * 2)
-static u8 scale2xBuffer[SCALE2X_BUF_SIZE] ATTRIBUTE_ALIGN(32);
+// Scale2x filter (FILTER_SCALE2X) - CPU pixel-doubling algorithm, moved to
+// videofilters.cpp/h (Scale2xRGB565(), scale2xBuffer) - see there for the
+// algorithm itself. Used below in WriteFrameToTextureMemory().
 
 /****************************************************************************
  * WriteFrameToTextureMemory
@@ -1558,6 +1562,27 @@ void GX_Render(int gbWidth, int gbHeight, u8 * buffer)
 	// Reset state and signal background VSync thread to begin waiting for next blanking interval
 	vb_done = false;
 	LWP_ThreadSignal(vb_queue);
+}
+
+/****************************************************************************
+ * GX_ThrottleVSync
+ *
+ * Paces the caller to real vertical-blank timing WITHOUT doing any of
+ * GX_Render()'s actual work (texture upload, draw, EFB->XFB copy). For
+ * frameskip's skipped-video frames in mgba_emuMain() (vbasupport.cpp) -
+ * before this existed, that path just returned early, skipping the ONLY
+ * thing that ever throttled the emulation loop to real time (the vsync
+ * wait normally buried inside GX_Render() itself, see the top of that
+ * function above). That let core->runFrame()/PushAudio() for however many
+ * frames Frameskip is set to run back-to-back as fast as the CPU could go,
+ * which is what was speeding up both audio and actual gameplay - not just
+ * video - on skipped frames. A direct VIDEO_WaitVSync() call here is
+ * independent of the vb_done/copynow double-buffering state GX_Render()
+ * itself manages, so it's safe to call without touching any of that.
+ ***************************************************************************/
+void GX_ThrottleVSync()
+{
+	VIDEO_WaitVSync();
 }
 
 /****************************************************************************
