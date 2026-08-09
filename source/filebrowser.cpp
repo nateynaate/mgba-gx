@@ -26,6 +26,12 @@
 #include "vmmem.h"
 #include "filebrowser.h"
 #include "menu.h"
+
+// Forward-declared here rather than added to menu.h, since that file
+// wasn't part of this change - ShowActionNow() is defined right next to
+// ShowAction() in menu.cpp (see its comment there for what it's for). Move
+// this into menu.h's own declaration of ShowAction() when convenient.
+void ShowActionNow(const char *msg);
 #include "video.h"
 #include "fileop.h"
 #include "input.h"
@@ -556,7 +562,13 @@ int BrowserLoadFile()
 	StripExt(ROMFilename, browserList[browser.selIndex].filename);
 	snprintf(GCSettings.LastFileLoaded, MAXPATHLEN, "%s", browserList[browser.selIndex].filename);
 
-	ShowAction ("Loading...");
+	// ShowActionNow(), not ShowAction(): a ROM load deserves the "Please
+	// Wait" window regardless of how fast it happens to finish - a zip'd
+	// ROM can decompress in under ProgressWindow()'s normal 0.8s debounce
+	// even though the equivalent uncompressed read off SD/USB reliably
+	// doesn't, which otherwise meant the window just never appeared for
+	// zip loads. See ShowActionNow()'s own comment (menu.cpp).
+	ShowActionNow ("Loading...");
 
 	loadingFile = true;
 	ROMLoaded = LoadVBAROM();
