@@ -277,6 +277,14 @@ static lwp_t progressthread = LWP_THREAD_NULL;
 static volatile bool guiHalt = true;
 static volatile int showProgress = 0;
 
+// Set by ShowActionNow() (below) to skip ProgressWindow()'s normal 0.8s
+// debounce for exactly one upcoming progress window - see that function's
+// comment for why this exists. Read-and-cleared by ProgressWindow() itself
+// so it only ever affects the single invocation it was set for, never
+// leaking into later, unrelated ShowAction()/ShowProgress() calls that
+// still want the normal flicker-avoidance debounce.
+static volatile bool progForceImmediate = false;
+
 // GUI thread synchronization
 static mutex_t guiMutex    = LWP_MUTEX_NULL;
 static cond_t  guiHaltCond = LWP_COND_NULL; // GUI thread -> main: halted
@@ -654,19 +662,37 @@ ProgressWindow(char *title, char *msg)
 		promptWindow.Append(&throbberImg);
 	}
 
-	// wait to see if progress flag changes soon
-	int progsleep = 800000;
-
-	while(progsleep > 0)
+	// wait to see if progress flag changes soon - skipped entirely when
+	// progForceImmediate is set (see ShowActionNow()'s comment for why):
+	// this debounce exists to avoid a flash-and-vanish flicker for
+	// operations that usually finish near-instantly, but it also means any
+	// operation that's USUALLY slow but occasionally fast (zip ROM
+	// decompression on a small ROM, for one - see BrowserLoadFile()) can
+	// end up racing under this 0.8s window and never getting shown at all,
+	// even though the equivalent uncompressed load reliably takes longer
+	// and always shows it. Callers that already know their operation
+	// deserves a visible "Please Wait" regardless of how fast it actually
+	// finishes should use ShowActionNow() instead of ShowAction() to opt
+	// out of this debounce for that one call.
+	if (progForceImmediate)
 	{
-		if(!showProgress)
-			break;
-		usleep(THREAD_SLEEP);
-		progsleep -= THREAD_SLEEP;
+		progForceImmediate = false; // one-shot - don't affect later calls
 	}
+	else
+	{
+		int progsleep = 800000;
 
-	if(!showProgress)
-		return;
+		while(progsleep > 0)
+		{
+			if(!showProgress)
+				break;
+			usleep(THREAD_SLEEP);
+			progsleep -= THREAD_SLEEP;
+		}
+
+		if(!showProgress)
+			return;
+	}
 
 	HaltGui();
 	int oldState = mainWindow->GetState();
@@ -804,6 +830,25 @@ ShowProgress (const char *msg, int done, int total)
 }
 
 /****************************************************************************
+ * ShowActionNow
+ *
+ * Same as ShowAction(), but skips ProgressWindow()'s normal 0.8s debounce
+ * for this one call - see that debounce's own comment for the full
+ * reasoning. Use this instead of ShowAction() for operations that are
+ * important enough to always show feedback for, even on the occasions
+ * they happen to finish fast (e.g. BrowserLoadFile() loading a ROM out of
+ * a small zip - decompression can legitimately finish under 0.8s even
+ * though an equivalent uncompressed ROM read off SD/USB reliably doesn't,
+ * which is exactly the gap this exists to close).
+ ***************************************************************************/
+void
+ShowActionNow (const char *msg)
+{
+	progForceImmediate = true;
+	ShowAction(msg);
+}
+
+/****************************************************************************
  * ShowAction
  *
  * Shows that an action is underway. Also resumes the progress window thread
@@ -853,8 +898,15 @@ int YesNoPrompt(const char *msg, bool yesDefault)
  *
  * Opens an on-screen keyboard window, with the data entered being stored
  * into the specified variable.
+ *
+ * `title`, if non-NULL, is shown above the keyboard as a plain heading -
+ * e.g. "Cheat Description" vs "Cheat Code (GameShark/Action Replay/Game
+ * Genie)" for the two-step cheat-add flow in MenuGameCheats(), so a
+ * generic reusable field editor can still tell the user what they're
+ * actually filling in right now. Every other call site (folder paths,
+ * etc.) passes nothing and gets the old untitled behavior unchanged.
  ***************************************************************************/
-static void OnScreenKeyboard(char * var, u32 maxlen)
+static void OnScreenKeyboard(char * var, u32 maxlen, const char *title = NULL)
 {
 	int save = -1;
 
@@ -899,9 +951,17 @@ static void OnScreenKeyboard(char * var, u32 maxlen)
 	keyboard.Append(&okBtn);
 	keyboard.Append(&cancelBtn);
 
+	// Optional heading, built even when `title` is NULL so it's always
+	// safe to Append/Remove below without an extra branch either side.
+	GuiText titleTxt(title ? title : "", 20, (GXColor){255, 255, 255, 255});
+	titleTxt.SetAlignment(ALIGN_CENTRE, ALIGN_TOP);
+	titleTxt.SetPosition(0, 25);
+
 	HaltGui();
 	mainWindow->SetState(STATE_DISABLED);
 	mainWindow->Append(&keyboard);
+	if (title)
+		mainWindow->Append(&titleTxt);
 	mainWindow->ChangeFocus(&keyboard);
 	ResumeGui();
 
@@ -922,6 +982,8 @@ static void OnScreenKeyboard(char * var, u32 maxlen)
 
 	HaltGui();
 	mainWindow->Remove(&keyboard);
+	if (title)
+		mainWindow->Remove(&titleTxt);
 	mainWindow->SetState(STATE_DEFAULT);
 	ResumeGui();
 }
@@ -4238,7 +4300,18 @@ static int MenuSettingsVideo()
 	// effect on real color data).
 	extern bool gGbDmgMode;
 	bool isDmgGame = !IsGBAGame() && gGbDmgMode;
+	// gGbcCapableRom reflects whether the currently loaded GB-platform
+	// ROM's own header declares real CGB color support (set in
+	// vbasupport.cpp). The GBC Boot Palette option only makes sense for a
+	// plain .gb-class game explicitly running under GBHardware == 1 (Game
+	// Boy Color) - a real .gbc game already has its own color data and
+	// ignores the boot palette system on real hardware too, and Auto mode
+	// never forces color rendering onto a game that isn't natively
+	// CGB-aware in the first place.
+	extern bool gGbcCapableRom;
+	bool showGbcPalette = !IsGBAGame() && !gGbcCapableRom && GCSettings.GBHardware == 1;
 	int idxGbPalette = -1;
+	int idxGbcBootPalette = -1;
 	int idxFilterMethod = -1;
 	int idxColorEmulation = -1;
 	int idxInterframeBlending = -1;
@@ -4265,6 +4338,10 @@ static int MenuSettingsVideo()
 	} else {
 		idxColorEmulation = i;
 		sprintf(options.name[i++], "GBC Color Emulation");
+	}
+	if (showGbcPalette) {
+		idxGbcBootPalette = i;
+		sprintf(options.name[i++], "GBC Boot Palette");
 	}
 	idxInterframeBlending = i;
 	sprintf(options.name[i++], "Interframe Blending");
@@ -4381,6 +4458,10 @@ static int MenuSettingsVideo()
 					GCSettings.BasicPalette++;
 					if (GCSettings.BasicPalette > 3)
 						GCSettings.BasicPalette = 0;
+				} else if (ret >= 0 && ret == idxGbcBootPalette) {
+					GCSettings.GBCPalette++;
+					if (GCSettings.GBCPalette > 12)
+						GCSettings.GBCPalette = 0;
 				} else if (ret >= 0 && ret == idxFilterMethod) {
 					GCSettings.FilterMethod++;
 					if (GCSettings.FilterMethod >= FILTER_LENGTH)
@@ -4474,6 +4555,20 @@ static int MenuSettingsVideo()
 			}
 
 			// Takes effect immediately, live, on the next rendered frame -
+			// no game reset needed. ApplyGBCBootPalette() (vbasupport.cpp)
+			// reasserts the selected palette's registers fresh every
+			// frame, same as ApplyGBPalette()/BasicPalette above.
+			if (idxGbcBootPalette >= 0) {
+				if (GCSettings.GBCPalette == 0) {
+					sprintf (options.value[idxGbcBootPalette], "Off");
+				} else {
+					extern const char *GetGBCBootPaletteName(int idx); // vbasupport.cpp
+					sprintf (options.value[idxGbcBootPalette], "%s",
+						GetGBCBootPaletteName(GCSettings.GBCPalette - 1));
+				}
+			}
+
+			// Takes effect immediately, live, on the next rendered frame -
 			// no game reset needed. ApplyGBPalette() (vbasupport.cpp) reads
 			// GCSettings.BasicPalette fresh every frame while gGbDmgMode is
 			// true, so simply changing the value above is enough.
@@ -4500,7 +4595,9 @@ static int MenuSettingsVideo()
 				sprintf (options.value[idxFilterMethod], "%s",
 					GCSettings.FilterMethod == FILTER_SCANLINES ? "Scanlines" :
 					GCSettings.FilterMethod == FILTER_SCALE2X ? "Scale2x" :
-					GCSettings.FilterMethod == FILTER_SHARP_BILINEAR ? "Sharp Bilinear" : "None");
+					GCSettings.FilterMethod == FILTER_SHARP_BILINEAR ? "Sharp Bilinear" :
+					GCSettings.FilterMethod == FILTER_LCD_GRID ? "LCD Grid" :
+					GCSettings.FilterMethod == FILTER_LCD_RGB ? "LCD RGB" : "None");
 			}
 
 			// Takes effect immediately, live, on the next rendered frame -
@@ -4590,7 +4687,14 @@ static void CheatsDeletePicker()
 	}
 	options.length = i;
 
-	GuiText titleTxt("Delete a Cheat", 26, (GXColor){255, 255, 255, 255});
+	// RomTitle (vbasupport.cpp) - the current game, so this screen doesn't
+	// just say "Delete a Cheat" with no indication of whose cheat list
+	// you're looking at. Same reasoning as MenuGameCheats()'s own title
+	// below.
+	extern char RomTitle[];
+	char titleStr[64];
+	snprintf(titleStr, sizeof(titleStr), "Delete a Cheat - %s", RomTitle);
+	GuiText titleTxt(titleStr, 26, (GXColor){255, 255, 255, 255});
 	titleTxt.SetAlignment(ALIGN_LEFT, ALIGN_TOP);
 	titleTxt.SetPosition(50, 50);
 
@@ -4653,47 +4757,32 @@ static void CheatsDeletePicker()
 }
 
 /****************************************************************************
- * MenuGameCheats
+ * CheatsBuildOptionList
  *
- * Blocking modal, not part of the MENU_* state machine (the enum lives in
- * a header this fork doesn't have on hand - see the call site in
- * MenuSettingsEmulation() for the same reasoning already used for
- * OnScreenKeyboard()). One GuiOptionBrowser row per cheat for the current
- * ROM; clicking a cheat row toggles it On/Off in place, the same
- * click-to-toggle interaction Snes9x GX/Snes9x TX's cheat lists use. Row
- * 0 is always "Add New Cheat..." (two OnScreenKeyboard prompts -
- * description, then the code itself - handed to CheatAdd(), which relies
- * on mGBA's own cheat parser to auto-detect Game Genie vs GameShark/
- * Action Replay format from the code text, so there's no separate format
- * picker to build). Row 1 is "Delete a Cheat..." (only shown once at
- * least one cheat exists), opening CheatsDeletePicker() above.
- *
- * Adding/deleting a cheat changes the row COUNT, which this simple
- * fixed-OptionList screen doesn't support mutating in place - those two
- * actions just tail-recurse back into a fresh call of this function
- * instead of trying to patch the existing GuiOptionBrowser's rows.
- * Toggling only changes a value string, so that one updates in place.
+ * Fills in the rows for MenuGameCheats() below: row 0 is always "Add New
+ * Cheat...", row 1 is "Delete a Cheat..." (only if at least one cheat
+ * exists), then one row per existing cheat (name + On/Off). Split out of
+ * MenuGameCheats() itself so add/delete can rebuild just the option data
+ * and hand it to a fresh GuiOptionBrowser in place, without tearing down
+ * and rebuilding the title/back button/window around it too - see the
+ * rebuild loop in MenuGameCheats() for why that matters.
  ***************************************************************************/
-static void MenuGameCheats()
+static void CheatsBuildOptionList(OptionList &options, int &idxAddCheat, int &idxDeleteCheat, int &cheatRowStart)
 {
 	// See MAX_CHEATS in vbagx.h - shared cap matching Snes9x TX's own
 	// MAX_CHEATS convention (cheatmgr.cpp).
 	const int MAX_CHEATS_SHOWN = MAX_CHEATS;
 
-	int menu = MENU_NONE;
-	int ret, i;
-	OptionList options;
-
 	int cheatCount = CheatCount();
 	if (cheatCount > MAX_CHEATS_SHOWN)
 		cheatCount = MAX_CHEATS_SHOWN;
 
-	i = 0;
-	int idxAddCheat = i;
+	int i = 0;
+	idxAddCheat = i;
 	sprintf(options.name[i++], "Add New Cheat...");
 	options.value[idxAddCheat][0] = 0;
 
-	int idxDeleteCheat = -1;
+	idxDeleteCheat = -1;
 	if (cheatCount > 0)
 	{
 		idxDeleteCheat = i;
@@ -4701,7 +4790,7 @@ static void MenuGameCheats()
 		options.value[idxDeleteCheat][0] = 0;
 	}
 
-	int cheatRowStart = i;
+	cheatRowStart = i;
 	for (int c = 0; c < cheatCount; c++)
 	{
 		char desc[64];
@@ -4712,18 +4801,98 @@ static void MenuGameCheats()
 		i++;
 	}
 	options.length = i;
+}
 
-	if (cheatCount == 0)
+/****************************************************************************
+ * CheatsAddNew
+ *
+ * The "Add New Cheat..." flow, split out of MenuGameCheats() below purely
+ * for readability. Two OnScreenKeyboard() prompts in sequence, each now
+ * given an explicit title so it's clear which field you're filling in and,
+ * for the code step, which cheat you're entering it for (the description
+ * you just typed a moment ago, easy to lose track of on the old untitled
+ * prompts). The actual code text is handed to CheatAdd() as-is; mGBA's own
+ * cheat parser auto-detects Game Genie vs GameShark/Action Replay format
+ * from it, so there's no separate format picker here.
+ *
+ * Returns true if a cheat was actually added (caller needs to rebuild its
+ * row list), false if the user backed out of either step or CheatAdd()
+ * rejected the code.
+ ***************************************************************************/
+static bool CheatsAddNew()
+{
+	char desc[64] = "";
+	// OnScreenKeyboard() edits the buffer in place and leaves it untouched
+	// if the user backs out (Cancel), same as every other settings field
+	// that uses it - empty after the call means "cancelled".
+	OnScreenKeyboard(desc, sizeof(desc), "Cheat Description");
+	if (desc[0] == 0)
+		return false;
+
+	char code[256] = "";
+	char codeTitle[96];
+	// Echoes the description back on this second prompt - without this,
+	// by the time you're staring at the code-entry keyboard you've often
+	// already forgotten exactly what you just typed as the name a few
+	// seconds ago, especially for a long code you're focused on getting
+	// right.
+	snprintf(codeTitle, sizeof(codeTitle), "Cheat Code for \"%s\"", desc);
+	OnScreenKeyboard(code, sizeof(code), codeTitle);
+	if (code[0] == 0)
+		return false;
+
+	if (!CheatAdd(desc, code))
 	{
-		// Nothing to toggle yet - still show the screen (so "Add New
-		// Cheat..." is reachable), just skip straight to it being empty.
+		InfoPrompt("Could not parse that cheat code.");
+		return false;
 	}
+	return true;
+}
 
-	// No title text here on purpose - this screen is only ever shown on top
-	// of another screen (the pause menu, or the Settings menu) that's been
-	// temporarily hidden by the caller, and that other screen already has
-	// its own title (usually the game's title) sitting at this same
-	// top-left spot. A second "Cheats" title here just overlapped it.
+/****************************************************************************
+ * MenuGameCheats
+ *
+ * Blocking modal, not part of the MENU_* state machine (the enum lives in
+ * a header this fork doesn't have on hand - see the call site in
+ * MenuSettingsEmulation() for the same reasoning already used for
+ * OnScreenKeyboard()). One GuiOptionBrowser row per cheat for the current
+ * ROM; clicking a cheat row toggles it On/Off in place, the same
+ * click-to-toggle interaction Snes9x GX/Snes9x TX's cheat lists use.
+ *
+ * Always shows its own "Cheats - <RomTitle>" title (RomTitle, from
+ * vbasupport.cpp), regardless of whether this was opened from the pause
+ * menu or the Settings menu. An earlier version deliberately omitted a
+ * title here, reasoning that the caller's own screen (already hidden
+ * underneath) had one in the same top-left spot - but that meant this
+ * screen carried no indication of which game's cheats you were looking
+ * at, since it's reachable from more than one place and the caller's
+ * title isn't actually visible while this modal is up.
+ *
+ * Row count changes (add/delete a cheat) used to tear down this entire
+ * screen - title, back button, window, all of it - and tail-recurse into
+ * a fresh call of this function to rebuild it, which was visibly janky
+ * (a full flash/rebuild for what's really just a list update) and grew
+ * the call stack one frame deeper per add/delete in a single visit.
+ * Instead, the title/back button/window are built ONCE outside the loop
+ * below and stay up across rebuilds; only the OptionList data and the
+ * GuiOptionBrowser showing it get recreated in place when the row count
+ * changes. Toggling a cheat doesn't even need that - it only changes one
+ * value string, updated via TriggerUpdate() same as before.
+ ***************************************************************************/
+static void MenuGameCheats()
+{
+	int menu = MENU_NONE;
+	int ret;
+
+	// RomTitle (vbasupport.cpp) - see the function comment above for why
+	// this screen now always shows its own title instead of relying on
+	// whatever screen is hidden underneath it.
+	extern char RomTitle[];
+	char titleStr[64];
+	snprintf(titleStr, sizeof(titleStr), "Cheats - %s", RomTitle);
+	GuiText titleTxt(titleStr, 26, (GXColor){255, 255, 255, 255});
+	titleTxt.SetAlignment(ALIGN_LEFT, ALIGN_TOP);
+	titleTxt.SetPosition(50, 50);
 
 	GuiSound btnSoundOver(button_over_pcm, button_over_pcm_size, SOUND_PCM);
 	GuiSound btnSoundClick(button_click_pcm, button_click_pcm_size, SOUND_PCM);
@@ -4745,76 +4914,70 @@ static void MenuGameCheats()
 	backBtn.SetTrigger(trigB);
 	backBtn.SetEffectGrow();
 
-	GuiOptionBrowser optionBrowser(552, 248, &options);
-	optionBrowser.SetPosition(0, 108);
-	optionBrowser.SetAlignment(ALIGN_CENTRE, ALIGN_TOP);
-
 	HaltGui();
 	GuiWindow w(screenwidth, screenheight);
 	w.Append(&backBtn);
-	mainWindow->Append(&optionBrowser);
 	mainWindow->Append(&w);
-	mainWindow->ChangeFocus(&w);
+	mainWindow->Append(&titleTxt);
 	ResumeGui();
 
-	bool needsRebuild = false;
-
+	// Rebuilt each time the row count changes (add/delete); the
+	// GuiOptionBrowser itself is recreated each pass since its row count
+	// is fixed at construction, but everything above (title, back button,
+	// window) stays up the whole time.
 	while (menu == MENU_NONE)
 	{
-		usleep(THREAD_SLEEP);
-		ret = optionBrowser.GetClickedOption();
+		OptionList options;
+		int idxAddCheat, idxDeleteCheat, cheatRowStart;
+		CheatsBuildOptionList(options, idxAddCheat, idxDeleteCheat, cheatRowStart);
 
-		if (ret == idxAddCheat)
+		GuiOptionBrowser optionBrowser(552, 248, &options);
+		optionBrowser.SetPosition(0, 108);
+		optionBrowser.SetAlignment(ALIGN_CENTRE, ALIGN_TOP);
+
+		HaltGui();
+		mainWindow->Append(&optionBrowser);
+		mainWindow->ChangeFocus(&w);
+		ResumeGui();
+
+		bool needsRebuild = false;
+		while (menu == MENU_NONE && !needsRebuild)
 		{
-			char desc[64] = "";
-			// OnScreenKeyboard() (this file, above) is void - it edits the
-			// buffer in place and leaves it untouched if the user backs
-			// out, same as every other settings field that uses it (e.g.
-			// GCSettings.SaveFolder above). Empty after the call is
-			// treated as "cancelled".
-			OnScreenKeyboard(desc, sizeof(desc));
-			if (desc[0] != 0)
+			usleep(THREAD_SLEEP);
+			ret = optionBrowser.GetClickedOption();
+
+			if (ret == idxAddCheat)
 			{
-				char code[256] = "";
-				OnScreenKeyboard(code, sizeof(code));
-				if (code[0] != 0)
-				{
-					if (!CheatAdd(desc, code))
-						InfoPrompt("Could not parse that cheat code.");
+				if (CheatsAddNew())
 					needsRebuild = true;
-					menu = MENU_GAME;
-				}
 			}
-		}
-		else if (idxDeleteCheat >= 0 && ret == idxDeleteCheat)
-		{
-			CheatsDeletePicker();
-			needsRebuild = true;
-			menu = MENU_GAME;
-		}
-		else if (ret >= cheatRowStart && ret < options.length)
-		{
-			CheatToggle(ret - cheatRowStart);
-			bool enabled = false;
-			char desc[64];
-			CheatGetInfo(ret - cheatRowStart, desc, sizeof(desc), &enabled);
-			sprintf(options.value[ret], "%s", enabled ? "On" : "Off");
-			optionBrowser.TriggerUpdate();
+			else if (idxDeleteCheat >= 0 && ret == idxDeleteCheat)
+			{
+				CheatsDeletePicker();
+				needsRebuild = true;
+			}
+			else if (ret >= cheatRowStart && ret < options.length)
+			{
+				CheatToggle(ret - cheatRowStart);
+				bool enabled = false;
+				char desc[64];
+				CheatGetInfo(ret - cheatRowStart, desc, sizeof(desc), &enabled);
+				sprintf(options.value[ret], "%s", enabled ? "On" : "Off");
+				optionBrowser.TriggerUpdate();
+			}
+
+			if (backBtn.GetState() == STATE_CLICKED)
+				menu = MENU_GAME;
 		}
 
-		if (backBtn.GetState() == STATE_CLICKED)
-			menu = MENU_GAME;
+		HaltGui();
+		mainWindow->Remove(&optionBrowser);
+		ResumeGui();
 	}
 
 	HaltGui();
-	mainWindow->Remove(&optionBrowser);
 	mainWindow->Remove(&w);
-
-	// Row count changed (add/delete) - rebuild the whole screen instead of
-	// trying to mutate options.length on a live GuiOptionBrowser. Does NOT
-	// recurse if the user just pressed Back with no changes.
-	if (needsRebuild)
-		MenuGameCheats();
+	mainWindow->Remove(&titleTxt);
 }
 
 /****************************************************************************
