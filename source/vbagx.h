@@ -124,6 +124,18 @@ enum {
 	// RetroArch's Wii U-only sharp-bilinear.slangp). Scoped off for SGB-
 	// bordered content and Fixed Pixel Ratio, same as FILTER_SCALE2X above.
 	FILTER_SHARP_BILINEAR,
+	// GX-hardware aperture-grille/LCD-grid mask - same technique as
+	// FILTER_SCANLINES (a small repeating texture multiplied against the
+	// game texture via a second TEV stage), just a different tile: vertical
+	// RGB subpixel stripes instead of horizontal darkened rows. See
+	// EnsureLCDGridTexture() in videofilters.cpp.
+	FILTER_LCD_GRID,
+	// GX-hardware colored LCD subpixel mask - same multiply-texture
+	// technique as FILTER_LCD_GRID, but a real RGB565 red/green/blue/gap
+	// tile instead of a monochrome intensity one, so it actually tints
+	// color per-column instead of just varying brightness. See
+	// EnsureLCDRGBTexture() in videofilters.cpp.
+	FILTER_LCD_RGB,
 	FILTER_LENGTH
 };
 
@@ -280,6 +292,17 @@ struct SGCSettings
 	int		Frameskip;
 
 	int		BasicPalette;	// 0 - Green   1 - Monochrome   2 - GB Pocket   3 - GB Light
+	// Manual-select GBC "Boot Palette" colorization for plain (non-CGB)
+	// .gb games, only meaningful when GBHardware == 1 (Game Boy Color is
+	// explicitly selected as the hardware, not Auto) and the loaded ROM
+	// isn't itself a real CGB-capable (.gbc-class) game - a true .gbc
+	// game always uses its own color data on real hardware too. Values:
+	// 0 = Off, 1-12 = the twelve manually-selectable boot palettes, in
+	// the same button-combo order as real GBC hardware (Up, A+Up, B+Up,
+	// Left, A+Left, B+Left, Down, A+Down, B+Down, Right, A+Right,
+	// B+Right). Applied once at ROM load in ApplyGBCBootPalette()
+	// (vbasupport.cpp) via direct writes to CGB palette RAM.
+	int		GBCPalette;
 	int		MotionTilt;		// Wii Remote tilt control for tilt-sensor GB/GBC games (0/1)
 
 	// If set, MenuGameSelection() shows the pre-tabs interface instead:
