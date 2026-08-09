@@ -18,6 +18,7 @@
 #include <malloc.h>
 #include <sys/param.h>
 #include <sys/stat.h>
+#include <time.h>
 
 #include <ogc/gx.h>
 #include <ogc/audio.h>
@@ -64,6 +65,7 @@
 #include "audio.h"
 #include "video.h"
 #include "fileop.h"
+#include "gcunzip.h"
 #include "input.h"
 #include "utils/pngu.h"
 
@@ -165,27 +167,68 @@ static const struct SaveTypeOverrideEntry knownSaveTypeOverrides[] = {
  * matching mGBA savetype config value, or NULL if none was found. Order
  * matters: FLASH512_V/FLASH1M_V must be checked before the bare FLASH_V,
  * since some libraries additionally emit a generic "FLASH_V" string
- * alongside the size-specific one and we want the more precise match. */
+ * alongside the size-specific one and we want the more precise match.
+ *
+ * PERFORMANCE: this used to run each of the 6 signatures as its own
+ * complete pass over the whole ROM (romSize * 6 positions, a real memcmp()
+ * call at EVERY position of EVERY pass) - fine for a GB/GBC-sized ROM, but
+ * for a near-max-size 16MB GBA ROM (Pokemon Ruby/Sapphire/Emerald/
+ * FireRed/LeafGreen are all right at that ceiling) that's up to ~100
+ * million memcmp() calls on a ~729MHz CPU with no SIMD - multiple seconds
+ * to over a minute, which is exactly indistinguishable from a genuine hang
+ * from the user's side, and scales directly with ROM size - which is why
+ * it was hitting specifically the largest GBA games and no GB/GBC ones
+ * (this function no-ops for CARTRIDGE_GB entirely, see the early return in
+ * ForceKnownSaveTypeOverrides() below).
+ *
+ * Fixed the same way any real substring search is: one single pass over
+ * the ROM (not six), with a cheap first-byte comparison before ever
+ * calling memcmp() - since a real match is rare, this skips the (relatively
+ * expensive, real-function-call) memcmp() entirely for the overwhelming
+ * majority of positions instead of paying for it every time. */
 static const char *DetectSaveTypeFromROM(const u8 *rom, size_t romSize)
 {
-    static const struct { const char *needle; const char *saveType; } signatures[] = {
-        { "EEPROM_V",   "EEPROM"   },
-        { "SRAM_F_V",   "SRAM"     },
-        { "SRAM_V",     "SRAM"     },
-        { "FLASH512_V", "FLASH512" },
-        { "FLASH1M_V",  "FLASH1M"  },
-        { "FLASH_V",    "FLASH512" }, // bare FLASH_V historically means the 64K/512kbit part
+    static const struct { const char *needle; size_t needleLen; const char *saveType; } signatures[] = {
+        { "EEPROM_V",   8, "EEPROM"   },
+        { "SRAM_F_V",   8, "SRAM"     },
+        { "SRAM_V",     6, "SRAM"     },
+        { "FLASH512_V", 10, "FLASH512" },
+        { "FLASH1M_V",  9, "FLASH1M"  },
+        { "FLASH_V",    7, "FLASH512" }, // bare FLASH_V historically means the 64K/512kbit part
     };
+    static const size_t numSignatures = sizeof(signatures) / sizeof(signatures[0]);
 
-    for (size_t s = 0; s < sizeof(signatures) / sizeof(signatures[0]); s++) {
-        size_t needleLen = strlen(signatures[s].needle);
-        if (needleLen >= romSize) continue;
-        for (size_t i = 0; i + needleLen <= romSize; i++) {
-            if (memcmp(rom + i, signatures[s].needle, needleLen) == 0)
-                return signatures[s].saveType;
+    if (romSize == 0) return NULL;
+
+    // Track the best (lowest index = highest priority) match found so far
+    // instead of returning on the first hit at any position - preserves
+    // the original priority-by-signature-index semantics (some ROMs embed
+    // both "FLASH1M_V" and a generic "FLASH_V" string; the specific one
+    // must win regardless of which happens to sit at an earlier byte
+    // offset) while still only walking the ROM once. Signature 0
+    // (EEPROM_V) can never be beaten, so that one still short-circuits
+    // immediately; anything else keeps scanning to make sure nothing
+    // higher-priority shows up later.
+    int bestIndex = -1;
+    for (size_t i = 0; i < romSize; i++) {
+        u8 b = rom[i];
+        for (size_t s = 0; s < numSignatures; s++) {
+            if (bestIndex >= 0 && (int)s >= bestIndex) break; // can't improve on what we already have
+            // Cheap prefilter: only the first character needs to match
+            // before paying for a real memcmp() at this position. All six
+            // signatures start with either 'E', 'S', or 'F', so this
+            // rejects the vast majority of positions with a single byte
+            // compare instead of a function call.
+            if (b != (u8)signatures[s].needle[0]) continue;
+            if (i + signatures[s].needleLen > romSize) continue;
+            if (memcmp(rom + i, signatures[s].needle, signatures[s].needleLen) == 0) {
+                bestIndex = (int)s;
+                if (bestIndex == 0) return signatures[0].saveType; // nothing outranks this
+                break;
+            }
         }
     }
-    return NULL;
+    return (bestIndex >= 0) ? signatures[bestIndex].saveType : NULL;
 }
 
 static void ForceKnownSaveTypeOverrides(struct mCore *core, const u8 *romBuffer, size_t romSize)
@@ -620,6 +663,30 @@ int gGbNativeH = 0;
  * ApplyGBPalette() in mgba_emuMain(). */
 bool gGbDmgMode = false;
 
+/* True when the currently loaded GB-platform ROM's own header declares CGB
+ * support (byte 0x143 bit 7) - i.e. it's a real .gbc-class game with its
+ * own color data, as opposed to a plain monochrome .gb game. Set alongside
+ * gGbDmgMode in LoadVBAROM(). Exposed for menu.cpp to gate the manual GBC
+ * Boot Palette setting (GCSettings.GBCPalette) to .gb games only - a true
+ * CGB game ignores the boot palette system on real hardware too, since it
+ * supplies its own palette data instead of relying on the boot-time
+ * compatibility mapping. */
+bool gGbcCapableRom = false;
+
+/* True when a plain .gb ROM is running with GBHardware explicitly set to
+ * Game Boy Color AND a manual GBC Boot Palette is selected
+ * (GCSettings.GBCPalette != 0). When this is set, the core is secretly
+ * forced to the DMG model (same trick gGbDmgMode/BasicPalette relies on)
+ * so its output is neutral achromatic grayscale, and ApplyGBCBootPalette()
+ * re-tints it as a pixel post-process - see that function's comment for
+ * why this replaced the old direct CGB-palette-RAM register-write
+ * approach. The menu still shows "Game Boy Color" as the selected
+ * hardware; only the internal rendering path is DMG. Mutually exclusive
+ * with gGbDmgMode (that's for the real GB Screen Palette setting, gated to
+ * GBHardware == Game Boy). Set in LoadVBAROM(); read every frame in
+ * mgba_emuMain(). */
+bool gGbcBootPaletteMode = false;
+
 extern void GX_Render(int w, int h, u8 *buf);
 extern void GX_Render_Init(int width, int height);
 
@@ -841,6 +908,150 @@ static void PushAudioGBC(const int16_t* fresh, size_t freshCount)
     }
 }
 
+// --- GBA dynamic-rate ring push --------------------------------------------
+// GBA previously relied solely on fpsRatio (computed once from the NOMINAL
+// GetCurrentTVFrameRate() value, see InitMGBAAudio()) plus the ring's fixed
+// 16384-word headroom to absorb any gap between that nominal assumption and
+// the real achieved callback rate. That's the same class of bug the GBC
+// dynamic-rate driver (audio.cpp) was built to fix, just never ported to
+// this path - under true PAL (50Hz) in particular, a real, sustained
+// mismatch between nominal and achieved rate can exceed what the fixed
+// headroom absorbs, since nothing here ever re-measures or corrects it.
+//
+// This mirrors GBC_AudioGetDynamicRate()'s hysteresis-gated pitch-bend, but
+// driven off the mixerdata ring's own occupancy (localHead - consumer)
+// rather than a small fixed-size buffer count, since GBA's ring is much
+// larger (16384 words vs GBC's 16 buffers). Thresholds below are scaled to
+// that same ring capacity (MIXERMASK_LOCAL + 1 words) rather than reusing
+// GBC's absolute buffer-count constants.
+#define GBA_RING_CAPACITY          (MIXERMASK_LOCAL + 1)
+#define GBA_UNPLAYED_HIGH_WATER    (GBA_RING_CAPACITY * 60 / 100) // building latency, slow down
+#define GBA_UNPLAYED_HIGH_RELEASE  (GBA_RING_CAPACITY * 45 / 100) // stay slow until drained back to here
+#define GBA_UNPLAYED_LOW_RELEASE   (GBA_RING_CAPACITY * 45 / 100) // stay fast until filled back to here
+#define GBA_UNPLAYED_LOW_WATER     (GBA_RING_CAPACITY * 30 / 100) // risk of underrun, speed up
+#define GBA_UNPLAYED_CRITICAL      (GBA_RING_CAPACITY * 5  / 100) // one stall from an audible dropout
+#define GBA_UNPLAYED_HIGH_CRITICAL (GBA_RING_CAPACITY * 85 / 100) // mirrors CRITICAL's margin from full
+#define GBA_RATE_SLOW_DOWN            1.005
+#define GBA_RATE_SPEED_UP             0.995
+#define GBA_RATE_EMERGENCY_SPEED_UP   0.985
+#define GBA_RATE_EMERGENCY_SLOW_DOWN  1.015
+#define GBA_RATE_NEUTRAL               1.0
+
+enum GBARateState {
+    GBA_RATE_STATE_NEUTRAL,
+    GBA_RATE_STATE_DRAINING, // running slow to shrink an over-full ring
+    GBA_RATE_STATE_FILLING,  // running fast to grow an under-full ring
+};
+static GBARateState s_gbaRateState = GBA_RATE_STATE_NEUTRAL;
+
+// Persistent accumulation buffer + fractional read position, same
+// phase-continuous-across-calls approach as PushAudioGBC()'s s_gbcAccum -
+// see that function's comment for why a fresh 0..N mapping per call is
+// wrong (it reintroduces the same phase-discontinuity problem this exists
+// to avoid).
+static s16    s_gbaAccum[20480 * 2];
+static int    s_gbaAccumCount = 0;
+static double s_gbaReadPos = 0.0;
+
+static double s_gbaRateSum = 0.0;
+static u32    s_gbaRateSamples = 0;
+static u64    s_gbaLastRatePrint = 0;
+
+static double GBA_GetDynamicRate(int occupancy)
+{
+    if (s_gbaRateState == GBA_RATE_STATE_DRAINING && occupancy <= GBA_UNPLAYED_HIGH_RELEASE) {
+        s_gbaRateState = GBA_RATE_STATE_NEUTRAL;
+    }
+    else if (s_gbaRateState == GBA_RATE_STATE_FILLING && occupancy >= GBA_UNPLAYED_LOW_RELEASE) {
+        s_gbaRateState = GBA_RATE_STATE_NEUTRAL;
+    }
+
+    if (occupancy > GBA_UNPLAYED_HIGH_WATER) {
+        s_gbaRateState = GBA_RATE_STATE_DRAINING;
+    }
+    else if (occupancy < GBA_UNPLAYED_LOW_WATER) {
+        s_gbaRateState = GBA_RATE_STATE_FILLING;
+    }
+
+    if (s_gbaRateState == GBA_RATE_STATE_DRAINING) {
+        return (occupancy >= GBA_UNPLAYED_HIGH_CRITICAL) ? GBA_RATE_EMERGENCY_SLOW_DOWN : GBA_RATE_SLOW_DOWN;
+    }
+    else if (s_gbaRateState == GBA_RATE_STATE_FILLING) {
+        return (occupancy <= GBA_UNPLAYED_CRITICAL) ? GBA_RATE_EMERGENCY_SPEED_UP : GBA_RATE_SPEED_UP;
+    }
+
+    return GBA_RATE_NEUTRAL;
+}
+
+static void PushAudioGBA(const int16_t* fresh, size_t freshCount)
+{
+    size_t room = (sizeof(s_gbaAccum) / (2 * sizeof(s16))) - s_gbaAccumCount;
+    if (freshCount > room) freshCount = room; // clamp - should not realistically be hit
+    memcpy(&s_gbaAccum[s_gbaAccumCount * 2], fresh, freshCount * 2 * sizeof(s16));
+    s_gbaAccumCount += (int)freshCount;
+
+    u32 *dst = (u32 *)GetMixerDataPtr();
+    volatile int *headPtr = GetMixerHeadPtr();
+    volatile int *tailPtr = GetMixerTailPtr();
+    int localHead = *headPtr;
+    int consumer  = *tailPtr;
+
+    for (;;)
+    {
+        int next = (localHead + 1) & MIXERMASK_LOCAL;
+        if (next == consumer) break; // ring full, wait for DMA to drain more
+
+        int occupancy = (localHead - consumer) & MIXERMASK_LOCAL;
+        double rate = GBA_GetDynamicRate(occupancy);
+        s_gbaRateSum += rate;
+        s_gbaRateSamples++;
+
+        double endPos = s_gbaReadPos + rate;
+        if ((int)endPos + 1 >= s_gbaAccumCount) break; // not enough source yet - wait for next call
+
+        int i0 = (int)s_gbaReadPos;
+        double frac = s_gbaReadPos - i0;
+        s16 l0 = s_gbaAccum[i0 * 2],       r0 = s_gbaAccum[i0 * 2 + 1];
+        s16 l1 = s_gbaAccum[(i0 + 1) * 2], r1 = s_gbaAccum[(i0 + 1) * 2 + 1];
+        s16 l = (s16)(l0 + (l1 - l0) * frac);
+        s16 r = (s16)(r0 + (r1 - r0) * frac);
+
+        // Same channel-reversal packing the old direct push used
+        // (v>>16 | v<<16) - keep it here at write time so the swap still
+        // happens exactly once, on the way into the ring.
+        u32 v = ((u32)(u16)l) | ((u32)(u16)r << 16);
+        dst[localHead] = (v >> 16) | (v << 16);
+        localHead = next;
+
+        s_gbaReadPos += rate;
+    }
+    *headPtr = localHead;
+
+    int consumedWhole = (int)s_gbaReadPos;
+    if (consumedWhole > 0) {
+        int remaining = s_gbaAccumCount - consumedWhole;
+        if (remaining > 0)
+            memmove(s_gbaAccum, &s_gbaAccum[consumedWhole * 2], (size_t)remaining * 2 * sizeof(s16));
+        s_gbaAccumCount = remaining;
+        s_gbaReadPos -= consumedWhole;
+    }
+
+    // Same periodic diagnostic as PushAudioGBC() - a sustained bias away
+    // from 1.0 here means the real achieved callback rate is genuinely off
+    // from the nominal fpsRatio assumption, not just absorbing jitter.
+    if (s_gbaRateSamples >= 60) {
+        u64 now = gettime();
+        if (s_gbaLastRatePrint == 0 || ticks_to_microsecs(now - s_gbaLastRatePrint) > 1000000) {
+            printf("[audio][gba] avg dynamic rate=%.5f over %lu chunks (occupancy=%d/%d)\n",
+                s_gbaRateSum / s_gbaRateSamples, (unsigned long)s_gbaRateSamples,
+                (*headPtr - *tailPtr) & MIXERMASK_LOCAL, GBA_RING_CAPACITY);
+            s_gbaRateSum = 0.0;
+            s_gbaRateSamples = 0;
+            s_gbaLastRatePrint = now;
+        }
+    }
+}
+
 // Called once per emulated frame from mgba_emuMain() below. Pulls whatever
 // the core has produced through the resampler and drains the result into
 // vbagx's existing mixerdata ring buffer (audio.cpp) - the consumer side
@@ -877,21 +1088,11 @@ static void PushAudio()
         return;
     }
 
-    // GBA: unchanged continuous ring push into audio.cpp's mixerdata.
-    u32 *src = (u32 *)tmp;
-    u32 *dst = (u32 *)GetMixerDataPtr();
-    volatile int *headPtr = GetMixerHeadPtr();
-    volatile int *tailPtr = GetMixerTailPtr();
-    int localHead = *headPtr;
-    int consumer  = *tailPtr;
-    for (size_t i = 0; i < avail; i++) {
-        int next = (localHead + 1) & MIXERMASK_LOCAL;
-        if (next == consumer) break;
-        u32 v = src[i];
-        dst[localHead] = ((v >> 16) | (v << 16));
-        localHead = next;
-    }
-    *headPtr = localHead;
+    // GBA: now rate-corrected against real ring occupancy - see
+    // PushAudioGBA()'s block comment above for why the old unconditional
+    // push (relying only on fpsRatio + fixed ring headroom) is the
+    // suspected cause of the reported true-PAL/50Hz drift.
+    PushAudioGBA(tmp, avail);
 }
 
 static void InitMGBAAudio()
@@ -994,6 +1195,166 @@ static void UnloadCore()
 }
 
 /* -------------------------------------------------------------------------
+ * GBC Boot Palette (manual-select colorization for plain GB games)
+ * ---------------------------------------------------------------------- */
+// Real GBC hardware, booting a monochrome-only (.gb) cartridge, maps the
+// game's legacy BGP/OBP0/OBP1 writes onto one of a small set of built-in
+// CGB color palettes - either an automatic per-game default (looked up via
+// a hash of the ROM title bytes) or one of twelve palettes the player can
+// force by holding a button combo through the boot logo. This implements
+// only the twelve manually-selectable ones (not the automatic per-game
+// hash table) as a menu option - GCSettings.GBCPalette (0 = Off, 1-12 =
+// the entries below). Gated in menu.cpp / here to CARTRIDGE_GB &&
+// GCSettings.GBHardware == 1 (Game Boy Color explicitly selected - Auto
+// mode never forces color onto a game that isn't natively CGB-aware,
+// matching real hardware) && !gGbcCapableRom (a real .gbc game supplies
+// its own color data and ignores this system too).
+//
+// RGB values transcribed from the boot ROM disassembly documented at
+// https://tcrf.net/Notes:Game_Boy_Color_Bootstrap_ROM/Palettes -
+// "Manual Select Palette Configurations" table, in the same order the
+// entries are stored in the ROM (also the real button-combo cycle order).
+// `combo` is that real button combo, kept as an internal/secondary label
+// only (some players know these by muscle memory from real GBC hardware).
+// `desc` is a plain-English description of what the palette actually
+// looks like when RENDERED BY THIS PORT SPECIFICALLY - i.e. derived only
+// from this entry's own bg[] values, never obj0[]/obj1[]. That matters:
+// ApplyGBCBootPalette() (below) is a pixel-level post-process that can't
+// distinguish BG pixels from sprite pixels once they're composited, so
+// only the bg[] ramp is ever actually applied to the screen - obj0[]/
+// obj1[] are stored here for completeness/reference but never render.
+// An earlier version of this table named entries after the full
+// official three-ramp palette (bg+obj0+obj1 together), which produced
+// wrong labels for the entries where those ramps use different hues -
+// e.g. A+Right's obj0 is reddish, but that color never appears on
+// screen, so labeling it "Green/Red" was actively misleading; it renders
+// as Green/Blue (its actual bg[] colors) and is named that way now.
+struct GBCBootPalette {
+    const char *combo;
+    const char *desc;
+    uint32_t bg[4];
+    uint32_t obj0[4];
+    uint32_t obj1[4];
+};
+
+static const struct GBCBootPalette kGBCBootPalettes[12] = {
+    { "Up",      "Orange/Brown",  {0xFFFFFF,0xFFAD63,0x843100,0x000000}, {0xFFFFFF,0xFFAD63,0x843100,0x000000}, {0xFFFFFF,0xFFAD63,0x843100,0x000000} },
+    { "A+Up",    "Red",           {0xFFFFFF,0xFF8484,0x943A3A,0x000000}, {0xFFFFFF,0x7BFF31,0x008400,0x000000}, {0xFFFFFF,0x63A5FF,0x0000FF,0x000000} },
+    { "B+Up",    "Sepia",         {0xFFE6C5,0xCE9C84,0x846B29,0x5A3108}, {0xFFFFFF,0xFFAD63,0x843100,0x000000}, {0xFFFFFF,0xFFAD63,0x843100,0x000000} },
+    { "Left",    "Blue",          {0xFFFFFF,0x63A5FF,0x0000FF,0x000000}, {0xFFFFFF,0xFF8484,0x943A3A,0x000000}, {0xFFFFFF,0x7BFF31,0x008400,0x000000} },
+    { "A+Left",  "Dusty Blue",    {0xFFFFFF,0x8C8CDE,0x52528C,0x000000}, {0xFFFFFF,0xFF8484,0x943A3A,0x000000}, {0xFFFFFF,0xFFAD63,0x843100,0x000000} },
+    { "B+Left",  "Grayscale",     {0xFFFFFF,0xA5A5A5,0x525252,0x000000}, {0xFFFFFF,0xA5A5A5,0x525252,0x000000}, {0xFFFFFF,0xA5A5A5,0x525252,0x000000} },
+    { "Down",    "Pastel Mix",    {0xFFFFA5,0xFF9494,0x9494FF,0x000000}, {0xFFFFA5,0xFF9494,0x9494FF,0x000000}, {0xFFFFA5,0xFF9494,0x9494FF,0x000000} },
+    { "A+Down",  "Yellow/Red",    {0xFFFFFF,0xFFFF00,0xFF0000,0x000000}, {0xFFFFFF,0xFFFF00,0xFF0000,0x000000}, {0xFFFFFF,0xFFFF00,0xFF0000,0x000000} },
+    { "B+Down",  "Yellow/Brown",  {0xFFFFFF,0xFFFF00,0x7B4A00,0x000000}, {0xFFFFFF,0x63A5FF,0x0000FF,0x000000}, {0xFFFFFF,0x7BFF31,0x008400,0x000000} },
+    { "Right",   "Green/Red",     {0xFFFFFF,0x52FF00,0xFF4200,0x000000}, {0xFFFFFF,0x52FF00,0xFF4200,0x000000}, {0xFFFFFF,0x52FF00,0xFF4200,0x000000} },
+    { "A+Right", "Green/Blue",    {0xFFFFFF,0x7BFF31,0x0063C5,0x000000}, {0xFFFFFF,0xFF8484,0x943A3A,0x000000}, {0xFFFFFF,0xFF8484,0x943A3A,0x000000} },
+    { "B+Right", "Inverted Teal", {0x000000,0x008484,0xFFDE00,0xFFFFFF}, {0x000000,0x008484,0xFFDE00,0xFFFFFF}, {0x000000,0x008484,0xFFDE00,0xFFFFFF} },
+};
+
+// Display-name accessor for menu.cpp (GCSettings.GBCPalette - 1, so
+// idx 0 == "Up" .. idx 11 == "B+Right", matching kGBCBootPalettes order).
+// Returns the plain-English color description (e.g. "Yellow/Red") rather
+// than the button combo, so the menu label itself tells you what you're
+// about to pick instead of requiring you to memorize/look up what each
+// combo looks like.
+const char *GetGBCBootPaletteName(int idx)
+{
+    if (idx < 0 || idx >= 12) return "";
+    return kGBCBootPalettes[idx].desc;
+}
+
+// Secondary accessor for anything that wants the real button combo (e.g.
+// a tooltip/help line noting "matches holding X on real hardware") instead
+// of the description GetGBCBootPaletteName() returns.
+const char *GetGBCBootPaletteCombo(int idx)
+{
+    if (idx < 0 || idx >= 12) return "";
+    return kGBCBootPalettes[idx].combo;
+}
+
+// Shared pixel-postprocess remap used by both GB Screen Palette (Green
+// Screen / Monochrome / Pocket / Light) and GBC Boot Palette below. DMG
+// output is always achromatic (R==G==B, four shades of pure gray); any
+// pixel that ISN'T achromatic is real color content (shouldn't happen when
+// gGbDmgMode/gGbcBootPaletteMode is true, but checking defensively costs
+// nothing) and is left untouched. This sidesteps needing to know mGBA's
+// exact internal default gray values, since "is this pixel grayscale" is
+// detected generically rather than matching specific hardcoded RGB565
+// constants. `shades` must have exactly 4 entries, lightest to darkest.
+// Both callers rebuild `shades` fresh on every call rather than caching it
+// keyed on the selected palette index, so a menu change takes effect on
+// the very next frame with no extra invalidation logic needed - the menu
+// setting is simply read live, every frame, the same way in both places.
+static void ApplyPaletteRemap(u16 *buf, int width, int height, int stride, const uint16_t shades[4])
+{
+    for (int y = 0; y < height; y++) {
+        u16 *row = buf + (size_t)y * stride;
+        for (int x = 0; x < width; x++) {
+            u16 px = row[x];
+            int r5 = (px >> 11) & 0x1F;
+            int g6 = (px >> 5)  & 0x3F;
+            int b5 =  px        & 0x1F;
+            int r8 = (r5 << 3) | (r5 >> 2);
+            int g8 = (g6 << 2) | (g6 >> 4);
+            int b8 = (b5 << 3) | (b5 >> 2);
+
+            int maxc = r8 > g8 ? (r8 > b8 ? r8 : b8) : (g8 > b8 ? g8 : b8);
+            int minc = r8 < g8 ? (r8 < b8 ? r8 : b8) : (g8 < b8 ? g8 : b8);
+            if (maxc - minc > 12) continue; // not grayscale - leave real color content alone
+
+            int brightness = (r8 + g8 + b8) / 3;
+            int shade = (brightness >= 192) ? 0 : (brightness >= 128) ? 1 : (brightness >= 64) ? 2 : 3;
+            row[x] = shades[shade];
+        }
+    }
+}
+
+// Applied as a pixel-level post-process, through the same ApplyPaletteRemap()
+// helper used by ApplyGBPalette() (GB Screen Palette, just below) - see that
+// function's comment for the full rationale on why pixel-postprocessing is
+// used at all. This replaced an earlier version that wrote the twelve
+// palettes directly into CGB palette RAM through the real $FF68-$FF6B
+// BCPS/BCPD registers (core->rawWrite8) the way real GBC boot-time
+// compatibility mapping works. That register path is the mechanically
+// "correct" one, but it depends on internals this port never fully verified
+// (whether the core's compositor re-reads palette RAM every scanline vs.
+// caching it, exact BCPS auto-increment semantics under this specific core
+// version) - genuine uncertainty, not just style preference. Reusing the
+// already-proven ApplyPaletteRemap() pixel-postprocessing path instead
+// sidesteps that uncertainty entirely, at one real cost: pixel-postprocessing
+// can't tell BG pixels from sprite pixels once they're composited, so only
+// ONE shared 4-color ramp (this palette's bg[] entries) can be applied
+// across the whole screen, not distinct BG/OBJ0/OBJ1 hues. Of the twelve
+// real palettes, six (Up, B+Left, Down, A+Down, Right, B+Right) actually use
+// identical BG/OBJ0/OBJ1 colors already, so those render exactly right; the
+// other six render using just their BG ramp as an approximation.
+//
+// Requires gGbcBootPaletteMode to be true - i.e. the core is secretly
+// rendering this game as DMG internally (see that flag's declaration
+// comment and LoadVBAROM()), so its output is neutral achromatic grayscale
+// for this function to re-tint, exactly like ApplyGBPalette() relies on
+// gGbDmgMode for the same reason.
+static void ApplyGBCBootPalette(u16 *buf, int width, int height, int stride)
+{
+    int idx = GCSettings.GBCPalette - 1; // GBCPalette: 0 = Off
+    if (idx < 0 || idx >= 12) return;
+    const struct GBCBootPalette *pal = &kGBCBootPalettes[idx];
+
+    // Rebuilt fresh every call (same as ApplyGBPalette()'s `shades` below) -
+    // no static cache - so cycling GCSettings.GBCPalette from the menu is
+    // live on the very next frame, exactly like GB Screen Palette.
+    uint16_t shades[4];
+    for (int i = 0; i < 4; i++) {
+        uint32_t rgb = pal->bg[i];
+        int r8 = (rgb >> 16) & 0xFF, g8 = (rgb >> 8) & 0xFF, b8 = rgb & 0xFF;
+        shades[i] = (uint16_t)(((r8 >> 3) << 11) | ((g8 >> 2) << 5) | (b8 >> 3));
+    }
+
+    ApplyPaletteRemap(buf, width, height, stride, shades);
+}
+
+/* -------------------------------------------------------------------------
  * GB Screen Palette (Green Screen / Monochrome Screen)
  * ---------------------------------------------------------------------- */
 // Applied as a pixel-level post-process rather than through the core, since
@@ -1002,14 +1363,8 @@ static void UnloadCore()
 // register-write path (core->rawWrite8 on BGP/OBP0/OBP1) can only reassign
 // which of the GB's fixed shade slots applies to a pixel value - it can't
 // inject arbitrary custom RGB colors, since real GB hardware doesn't
-// support that either.
-//
-// Instead: DMG output is always achromatic (R==G==B, four shades of pure
-// gray). Any pixel that ISN'T achromatic is real color content (shouldn't
-// happen when gGbDmgMode is true, but checking defensively costs nothing)
-// and is left untouched. This sidesteps needing to know mGBA's exact
-// internal default gray values, since we detect "is this pixel grayscale"
-// generically rather than matching specific hardcoded RGB565 constants.
+// support that either. See ApplyPaletteRemap() above for the shared
+// grayscale-detection/remap loop this and ApplyGBCBootPalette() both use.
 static void ApplyGBPalette(u16 *buf, int width, int height, int stride)
 {
     // RGB565 target colors, lightest to darkest.
@@ -1036,26 +1391,7 @@ static void ApplyGBPalette(u16 *buf, int width, int height, int stride)
                             : (GCSettings.BasicPalette == 1) ? monoShades
                             : greenShades;
 
-    for (int y = 0; y < height; y++) {
-        u16 *row = buf + (size_t)y * stride;
-        for (int x = 0; x < width; x++) {
-            u16 px = row[x];
-            int r5 = (px >> 11) & 0x1F;
-            int g6 = (px >> 5)  & 0x3F;
-            int b5 =  px        & 0x1F;
-            int r8 = (r5 << 3) | (r5 >> 2);
-            int g8 = (g6 << 2) | (g6 >> 4);
-            int b8 = (b5 << 3) | (b5 >> 2);
-
-            int maxc = r8 > g8 ? (r8 > b8 ? r8 : b8) : (g8 > b8 ? g8 : b8);
-            int minc = r8 < g8 ? (r8 < b8 ? r8 : b8) : (g8 < b8 ? g8 : b8);
-            if (maxc - minc > 12) continue; // not grayscale - leave real color content alone
-
-            int brightness = (r8 + g8 + b8) / 3;
-            int shade = (brightness >= 192) ? 0 : (brightness >= 128) ? 1 : (brightness >= 64) ? 2 : 3;
-            row[x] = shades[shade];
-        }
-    }
+    ApplyPaletteRemap(buf, width, height, stride, shades);
 }
 
 /* -------------------------------------------------------------------------
@@ -1332,6 +1668,16 @@ static void mgba_emuMain(int count)
 
     if (gGbDmgMode) {
         ApplyGBPalette(videoBuf, gbCoreW, gbCoreH, gGbVideoStride);
+    } else if (gGbcBootPaletteMode) {
+        // GBC Boot Palette, applied the same pixel-postprocessing way as
+        // ApplyGBPalette() just above - see ApplyGBCBootPalette()'s own
+        // comment for why. Called every frame (not just once after reset)
+        // so the menu setting is live, same as BasicPalette above. Color
+        // correction below is skipped for this path, same as the gGbDmgMode
+        // branch above - the core is rendering neutral grayscale here (see
+        // gGbcBootPaletteMode), so there's no real color data for the GBC
+        // color-emulation matrix to meaningfully correct.
+        ApplyGBCBootPalette(videoBuf, gbCoreW, gbCoreH, gGbVideoStride);
     } else {
         const struct ColorMatrix *wantMatrix = NULL;
         if (cartridgeType == CARTRIDGE_GBA) {
@@ -1709,16 +2055,50 @@ bool LoadVBAROM()
 
     FILE *fp = fopen(romPath, "rb");
     if (!fp) { printf("[mGBA] fopen failed: %s\n", romPath); return false; }
-    fseek(fp, 0, SEEK_END);
-    size_t romSize = (size_t)ftell(fp);
+
+    // ZIP support: this is the actual ROM-loading path mGBA-GX uses (see
+    // BrowserLoadFile() -> here), which is entirely separate from the old
+    // VBA-GX LoadFile()/gcunzip.cpp path in fileop.cpp - that older path
+    // still exists (used for save states/screenshots/etc, via savebuffer)
+    // but was never wired into ROM loading after this fork rewrote it to
+    // read straight into the MEM2 romBuffer below for VFileFromConstMemory.
+    // Previously a .zip here just had its raw compressed bytes read
+    // straight into romBuffer and handed to mCoreFindVF(), which correctly
+    // rejected it as not a valid ROM - "Error loading game" was mGBA
+    // correctly detecting that the zip container itself isn't a ROM, not a
+    // bug in the core. UnZipBuffer() (gcunzip.cpp) already knows how to
+    // find and decompress the actual ROM entry inside a zip; it just
+    // needs the global `file` (fileop.h) pointed at our already-open fp,
+    // since that's what it reads through.
+    char zipSniff[4];
+    size_t sniffRead = fread(zipSniff, 1, sizeof(zipSniff), fp);
     rewind(fp);
-    if (romSize > romBufferSize) {
+
+    size_t romSize;
+    if (sniffRead == sizeof(zipSniff) && IsZipFile(zipSniff))
+    {
+        file = fp; // gcunzip.cpp's UnZipBuffer() reads through this global
+        romSize = UnZipBuffer((unsigned char *)romBuffer, romBufferSize);
         fclose(fp);
-        printf("[mGBA] ROM too large: %u bytes\n", (unsigned)romSize);
-        return false;
+        if (romSize == 0)
+        {
+            printf("[mGBA] ZIP did not contain a loadable ROM: %s\n", romPath);
+            return false;
+        }
     }
-    fread(romBuffer, 1, romSize, fp);
-    fclose(fp);
+    else
+    {
+        fseek(fp, 0, SEEK_END);
+        romSize = (size_t)ftell(fp);
+        rewind(fp);
+        if (romSize > romBufferSize) {
+            fclose(fp);
+            printf("[mGBA] ROM too large: %u bytes\n", (unsigned)romSize);
+            return false;
+        }
+        fread(romBuffer, 1, romSize, fp);
+        fclose(fp);
+    }
 
     // Must happen here - before VFileFromConstMemory()/core->loadROM()
     // below - not after, the way this used to work via core->loadPatch().
@@ -1778,14 +2158,63 @@ bool LoadVBAROM()
     bool romSupportsCGB = (cartridgeType == CARTRIDGE_GB && romSize > 0x143 &&
                             (((u8*)romBuffer)[0x143] & 0x80) != 0);
 
+    /* A manual GBC Boot Palette only makes sense for a plain .gb ROM
+     * explicitly running under GBHardware == Game Boy Color - a real
+     * .gbc-class ROM (romSupportsCGB) supplies its own color data and
+     * ignores the boot-time compatibility mapping on real hardware too.
+     * When this is true, the "CGB" case below is overridden to secretly
+     * request the DMG model instead, so the core's output is neutral
+     * achromatic grayscale for ApplyGBCBootPalette() to re-tint as a pixel
+     * post-process - see gGbcBootPaletteMode's declaration comment.
+     *
+     * Deliberately NOT conditioned on GCSettings.GBCPalette's value (unlike
+     * an earlier version of this code, which required GBCPalette >= 1 here
+     * too). This must match ANY plain .gb cart running as GBHardware ==
+     * Game Boy Color, exactly the same set of games showGbcPalette (menu.cpp)
+     * exposes the option for - the whole point of GB Screen Palette
+     * (gGbDmgMode/BasicPalette, immediately below) being changeable live,
+     * mid-game, is that gGbDmgMode only depends on the game/hardware combo,
+     * never on which shade is currently selected, so BasicPalette can just
+     * be read fresh every frame inside ApplyGBPalette(). Gating this forced-
+     * DMG request on GBCPalette's value at load time broke that same
+     * contract for GBC Boot Palette specifically: if the game was loaded
+     * with the option Off, the core would boot straight into real CGB
+     * color, gGbcBootPaletteMode would latch false for the rest of that
+     * session, and picking a palette from the in-game menu afterward would
+     * change GCSettings.GBCPalette but ApplyGBCBootPalette() would never
+     * run to act on it - the game would keep rendering its real color
+     * output, unchanged, no matter what got selected. Forcing DMG here
+     * whenever the game/hardware combo qualifies - independent of whether
+     * GBCPalette is currently Off or a specific palette - keeps the core
+     * output achromatic the whole time such a game is running, so toggling
+     * GBCPalette between Off and any of the twelve palettes from the menu
+     * takes effect live on the very next frame, matching GB Screen
+     * Palette's behavior exactly. */
+    bool wantGBCBootPalette = (cartridgeType == CARTRIDGE_GB &&
+                                GCSettings.GBHardware == 1 && !romSupportsCGB);
+
     const char *sgbModelStr = NULL;
     bool wantSGBHardware = false;
     if (cartridgeType == CARTRIDGE_GB) {
         switch (GCSettings.GBHardware) {
-            case 1: sgbModelStr = "CGB"; break;                              // Game Boy Color
+            case 1: sgbModelStr = wantGBCBootPalette ? "DMG" : "CGB"; break;  // Game Boy Color
             case 2: sgbModelStr = "SGB";  wantSGBHardware = true; break;     // Super Game Boy
             case 3: sgbModelStr = "SGB2"; wantSGBHardware = true; break;     // Super Game Boy 2
-            case 4: sgbModelStr = "DMG"; break;                              // Game Boy
+            // GBHardware == 4 (explicit "Game Boy") is the one case where
+            // romSupportsCGB overrides the requested model rather than just
+            // suppressing palette effects on top of it (like gGbDmgMode/
+            // wantGBCBootPalette do above): real DMG hardware physically
+            // refuses to boot a CGB-capable cart (it shows an "only for
+            // Game Boy Color" boot screen and halts), so "force Game Boy"
+            // isn't a real, reachable state for one of these ROMs on actual
+            // hardware - there's nothing correct to emulate by honoring it.
+            // Defaulting to CGB instead (same as Auto would pick) is the
+            // closest real match to what an actual console does: it's not
+            // silently ignoring the setting, it's substituting the one
+            // model that's real-hardware-legal for this cart, the same way
+            // Auto already resolves it. GBA (case 5) is left alone since
+            // that's a different compatibility mode, not a plain boot.
+            case 4: sgbModelStr = romSupportsCGB ? "CGB" : "DMG"; break;     // Game Boy
             case 5: sgbModelStr = "AGB"; break;                              // Game Boy Advance (GBC compat)
             case 0: default:                                                // Auto
                 if (romDeclaresSGB && GCSettings.SGBBorder == 1) {
@@ -1806,7 +2235,21 @@ bool LoadVBAROM()
         mCoreConfigSetValue(&core->config, "sgb.model", sgbModelStr);
     }
 
-    gGbDmgMode = (cartridgeType == CARTRIDGE_GB && sgbModelStr && strcmp(sgbModelStr, "DMG") == 0);
+    // A real .gbc-class ROM (romSupportsCGB) is excluded from gGbDmgMode
+    // here as well as from wantGBCBootPalette above: it was never designed
+    // to run on plain DMG hardware or with GBC's monochrome-compatibility
+    // boot palettes, and forcing either onto it (e.g. by setting GBHardware
+    // to "Game Boy" on a .gbc game) produces garbage - the game's own
+    // color-aware tile/sprite data was never authored to look right
+    // reduced to 4 shades this way. Real hardware has no equivalent mode
+    // for this either: a CGB-flagged cart always boots into color. So
+    // regardless of what GCSettings.GBHardware says, a CGB-capable ROM
+    // never gets GB Screen Palette or GBC Boot Palette applied.
+    gGbDmgMode = (cartridgeType == CARTRIDGE_GB && sgbModelStr &&
+                  strcmp(sgbModelStr, "DMG") == 0 && !wantGBCBootPalette &&
+                  !romSupportsCGB);
+    gGbcBootPaletteMode = wantGBCBootPalette;
+    gGbcCapableRom = romSupportsCGB;
 
     bool enableBorder = wantSGBHardware && GCSettings.SGBBorder == 1;
     mCoreConfigSetIntValue(&core->config, "sgb.borders", enableBorder ? 1 : 0);
@@ -1838,6 +2281,41 @@ bool LoadVBAROM()
     }
 
     core->init(core);
+
+    /* RTC offset (GBA GPIO-RTC carts only: Pokemon Ruby/Sapphire/Emerald,
+     * Boktai, etc.) - GCSettings.OffsetMinutesUTC was already a persisted,
+     * user-cyclable menu setting (preferences.cpp/menu.cpp, "Offset from
+     * UTC (minutes)") but had no effect until now.
+     *
+     * IMPORTANT: do NOT call mRTCGenericSourceInit() here. core->init()
+     * (just above) already did that internally - _GBACoreInit()
+     * (src/gba/core.c in mgba itself) unconditionally runs
+     * "mRTCGenericSourceInit(&core->rtc, core); gba->rtcSource =
+     * &core->rtc.d;" as part of core creation, before any ROM is loaded.
+     * This is also why the official Wii standalone port needs zero RTC
+     * code of its own - every mGBA frontend gets a live, working RTC
+     * source for free at core->init() time.
+     *
+     * Our previous bug: we called mRTCGenericSourceInit() a SECOND time,
+     * much later (after loadROM, right before reset), re-initializing a
+     * source struct the core had already wired up and may already have
+     * begun relying on. That's what hung real hardware solid the instant
+     * a GPIO-RTC cart issued RTC command 6 (Get Date/Time) - not a
+     * gmtime()/localtime() reentrancy problem (ruled out: hung identically
+     * under both RTC_WALLCLOCK_OFFSET and RTC_FAKE_EPOCH), but stomping on
+     * live RTC state mid-flight via a redundant re-init.
+     *
+     * The fix: just set override/value directly on the struct core->init()
+     * already initialized - no re-init call - and do it here, right after
+     * core->init(), long before loadROM()/reset() even run, so there's no
+     * repeat of the ordering hazard either. Gated to GBA only: core->rtc /
+     * gba->rtcSource is the GBA-specific wiring in _GBACoreInit; GB/GBC
+     * MBC3 RTC (Pokemon Gold/Silver/Crystal) goes through a different
+     * mechanism this doesn't touch and hasn't been retested here. */
+    if (cartridgeType == CARTRIDGE_GBA) {
+        core->rtc.override = RTC_WALLCLOCK_OFFSET;
+        core->rtc.value = (int64_t)GCSettings.OffsetMinutesUTC * 60;
+    }
 
     /* Default audio volume - see mCoreLoadConfig()'s own comment just below
      * for why core->opts (which the "volume" key feeds into) needs an
@@ -1894,6 +2372,36 @@ bool LoadVBAROM()
      * frontend does this. */
     ForceKnownSaveTypeOverrides(core, (const u8 *)romBuffer, romSize);
     mCoreLoadConfig(core);
+
+    /* Real-time RTC source, for GBA carts (Pokemon Ruby/Sapphire/Emerald,
+     * Boktai, etc.) and GB/GBC MBC3/TAMA5 carts (Pokemon Gold/Silver/
+     * Crystal) alike. mGBA's own built-in overrides.c table (pulled in via
+     * mCoreLoadConfig() just above) already autodetects which carts have
+     * an RTC chip from the ROM's game code - this only supplies what time
+     * that chip reports once the core has decided one is present; it does
+     * not need to (and does not) force RTC on for carts mGBA doesn't
+     * already recognize as having it. RTC_WALLCLOCK_OFFSET uses the Wii's
+     * real system time plus a fixed offset in seconds -
+     * GCSettings.OffsetMinutesUTC was already a persisted, user-cyclable
+     * menu setting (see preferences.cpp/menu.cpp, "Offset from UTC
+     * (minutes)") but was never actually read by the core before now, so
+     * it was a no-op setting. When OffsetMinutesUTC is still 0 (untouched
+     * default), this is just real Wii system time unmodified - correct
+     * default behavior needing no special-casing.
+     *
+     * NOTE: this used to run here, before core->loadROM(). That hung
+     * core->loadROM() forever for every GB/GBC cart (confirmed via
+     * printf tracing + diffing against a known-working revision -
+     * disabling just this block, calls and all, fixed GB/GBC loading;
+     * GBA was unaffected either way). Root cause: for the GB core, the
+     * cart's mapper (MBC1/MBC3/etc.) isn't parsed until core->loadROM()
+     * runs, and mCoreSetRTC() on the GB path appears to touch
+     * mapper/RTC peripheral state that only exists once that parsing has
+     * happened - the GBA GPIO-RTC path tolerates being set up early, the
+     * GB MBC3-RTC path does not. Moved to after core->loadROM() (see
+     * below) so the mapper is already known by the time this runs. Must
+     * still run before core->reset(), since reset() is what actually
+     * hands the RTC source to the emulated hardware. */
 
     // 16384, up from 4096 - see PushAudio()'s comment. If this fills up
     // mid-frame, GBAudioSample() (src/gb/audio.c) calls GBInterrupt(),
@@ -1994,11 +2502,38 @@ bool LoadVBAROM()
     if (!prevVideoBuf) { free(videoBuf); free(correctedVideoBuf); videoBuf = NULL; correctedVideoBuf = NULL; core->deinit(core); core = NULL; return false; }
     memset(prevVideoBuf, 0, MAX_BUF_W * MAX_BUF_H * sizeof(u16));
 
+    printf("[mGBA][trace] before core->loadROM\n");
     if (!core->loadROM(core, romVF)) {
         printf("[mGBA] Failed to load ROM\n");
         UnloadCore();
         return false;
     }
+    printf("[mGBA][trace] after core->loadROM\n");
+
+    /* RTC: intentionally NOT set up here. We previously registered a
+     * custom mRTCGenericSource (RTC_WALLCLOCK_OFFSET, then RTC_FAKE_EPOCH
+     * as a diagnostic) after loadROM/before reset, but both hung real
+     * hardware solid the moment a GBA GPIO-RTC cart (Pokemon Ruby/
+     * Sapphire/Emerald) issued RTC command 6 (Get Date/Time) - confirmed
+     * via [mGBA][trace] logs showing the whole process (audio included)
+     * stop dead right after "Got RTC command 6", with no crash/exception.
+     * Since the hang reproduced with BOTH override modes, it isn't
+     * specific to real-time sampling (gmtime/localtime) - something about
+     * registering a custom RTC source on this port trips it, and we
+     * haven't root-caused it yet (would need mGBA's own rtc.c/gpio.c to
+     * dig further, which isn't in this tree).
+     *
+     * mGBA's official Wii standalone port (mgba-emu/mgba,
+     * src/platform/wii/main.c) never sets up an RTC source at all - no
+     * mRTCGenericSourceInit, no mCoreSetRTC, anywhere in it - and relies
+     * entirely on the core's own built-in default RTC handling for
+     * RTC-equipped carts. Matching that (i.e. doing nothing here) is the
+     * known-safe baseline until this is properly root-caused.
+     *
+     * GCSettings.OffsetMinutesUTC stays as a persisted menu setting
+     * (preferences.cpp/menu.cpp) for whenever RTC support is revisited -
+     * it's just unused for now. */
+
 
     // Patch application now happens earlier, directly against romBuffer,
     // before VFileFromConstMemory()/core->loadROM() above - see
@@ -2040,10 +2575,15 @@ bool LoadVBAROM()
      * FILE_SNAPSHOT (save states) is intentionally NOT moved: a state
      * restores serialized RTC/full-machine state on top of a clean reset,
      * so it still needs to run after core->reset(), further below. */
-    if (GCSettings.AutoLoad == 1)
+    if (GCSettings.AutoLoad == 1) {
+        printf("[mGBA][trace] before LoadBatteryOrStateAuto\n");
         LoadBatteryOrStateAuto(FILE_SRAM, SILENT);
+        printf("[mGBA][trace] after LoadBatteryOrStateAuto\n");
+    }
 
+    printf("[mGBA][trace] before core->reset\n");
     core->reset(core);
+    printf("[mGBA][trace] after core->reset\n");
 
     // Now that the ROM is loaded and reset, use currentVideoSize() - NOT
     // baseVideoSize(), which always reports the platform's maximum/static
@@ -2060,7 +2600,25 @@ bool LoadVBAROM()
         gbCoreW = (int)coreW;
         gbCoreH = (int)coreH;
         // Update stride and re-point the video buffer with the true dimensions.
-        int trueStride = (sgbBordered && gbCoreW == 256) ? gbCoreW : (gbCoreW + 2);
+        //
+        // Deliberately NOT keyed on the locally-computed `sgbBordered` bool
+        // here (that's just our own pre-load intention, set from
+        // GCSettings.SGBBorder before mCoreLoadConfig()/reloadConfigOption()
+        // ran) - mCoreLoadConfig() (just above) reloads "sgb.borders" from
+        // config.ini/override tables on top of whatever we explicitly set,
+        // and reloadConfigOption() then pushes THAT possibly-different value
+        // into the live core. So `sgbBordered` can end up stale relative to
+        // what the core actually resolved to. currentVideoSize() above is
+        // the one thing that's authoritative about the REAL post-reset
+        // state - if it reports 256 wide, the core genuinely is rendering
+        // its own SGB border into an unpadded 256-pixel-stride buffer
+        // (that's the one case mGBA's currentVideoSize() ever returns 256),
+        // regardless of what we predicted it would do. Trusting our stale
+        // guess here instead of gbCoreW itself was producing a real 2-pixel-
+        // per-row stride mismatch (256 actual vs 258 assumed) whenever the
+        // two disagreed - a consistent shifted/repeated-pixel artifact on
+        // every SGB game that hit this mismatch.
+        int trueStride = (gbCoreW == 256) ? gbCoreW : (gbCoreW + 2);
         gGbVideoStride = trueStride;
         core->setVideoBuffer(core, (mColor*)videoBuf, trueStride);
         printf("[mGBA] Video: %dx%d stride=%d sgbBordered=%d\n",
