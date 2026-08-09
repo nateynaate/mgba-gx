@@ -93,7 +93,73 @@ IsZipFile (char *buffer)
 }
 
 /*****************************************************************************
+* IsRomEntryName
+*
+* True if the given zip entry name (NOT null-terminated - len comes from
+* the local header's own filenameLength field) looks like a ROM this port
+* can load, based on its extension - the exact same extension set
+* fileop.cpp's ParseDirEntries() already accepts when browsing a plain
+* directory (minus zip/7z themselves - an archive isn't expected to
+* legitimately contain another archive as its actual payload here). Also
+* rejects directory entries (trailing '/').
+******************************************************************************/
+static bool
+IsRomEntryName(const char *name, unsigned short len)
+{
+	if (len == 0 || name[len - 1] == '/')
+		return false; // directory entry
+
+	int dot = -1;
+	for (int i = (int)len - 1; i >= 0; i--)
+	{
+		if (name[i] == '.') { dot = i; break; }
+		if (name[i] == '/') break; // hit a path separator before any '.' - no extension
+	}
+	if (dot < 0)
+		return false;
+
+	const char *ext = name + dot + 1;
+	int extlen = (int)len - (dot + 1);
+
+	static const char *kRomExts[] = {
+		"agb", "gba", "bin", "elf", "mb", "dmg", "gb", "gbc", "cgb", "sgb"
+	};
+	for (unsigned i = 0; i < sizeof(kRomExts) / sizeof(kRomExts[0]); i++)
+	{
+		if ((int)strlen(kRomExts[i]) == extlen &&
+		    strncasecmp(ext, kRomExts[i], extlen) == 0)
+			return true;
+	}
+	return false;
+}
+
+/*****************************************************************************
 * UnZipBuffer
+*
+* Walks the zip's local file headers starting at offset 0 looking for the
+* first entry that's actually a ROM (by extension - see IsRomEntryName()
+* above), skipping directory entries and any non-ROM files (readmes, box
+* art, macOS's __MACOSX/ metadata, etc.) instead of blindly assuming
+* whichever entry happens to be first in the archive is the one to load.
+* Previously this only ever looked at entry #0, which is why a zip with
+* anything other than a single bare ROM file in it would extract the wrong
+* data, pass it to the core as if it were a valid ROM, and fail with
+* "Error loading game" once the core actually tried to parse it.
+*
+* Also now checks compressionMethod and handles Store (0, raw copy) as
+* well as Deflate (8, existing zlib path) - some zip tools use Store for
+* very small or already-compressed entries, which previously always
+* failed since only Deflate was ever attempted.
+*
+* Known limitation: doesn't handle zip64 or the general-purpose-flag bit 3
+* "streamed" case (sizes deferred to a trailing data descriptor instead of
+* the local header) - both are rare for the kind of straightforward
+* single/few-file archives ROMs are typically distributed in, and
+* supporting them needs a real central-directory parse (like SzParse()
+* already does for 7z) rather than a plain local-header walk. If that
+* turns out to matter in practice, the right fix is giving zip the same
+* full-listing browse-before-load treatment 7z already gets, rather than
+* extending this into a bigger local-header hack.
 ******************************************************************************/
 
 size_t
@@ -104,31 +170,101 @@ UnZipBuffer (unsigned char *outbuffer, size_t buffersize)
 	size_t zipchunk = 0;
 	char out[ZIPCHUNK];
 	z_stream zs;
-	int res;
+	int res = Z_OK;
 	size_t bufferoffset = 0;
 	size_t have = 0;
 	char readbuffer[ZIPCHUNK];
 	size_t sizeread = 0;
+	size_t entryOffset = 0;
+	char entryName[256];
 
-	// Read Zip Header
-	fseek(file, 0, SEEK_SET);
-	sizeread = fread (readbuffer, 1, ZIPCHUNK, file);
+	// Walk local file headers until we find one that looks like an actual
+	// ROM, or give up. Capped iteration count as a safety net against a
+	// corrupt/malformed archive looping forever.
+	for (int guard = 0; guard < 64; guard++)
+	{
+		if (fseek(file, (long)entryOffset, SEEK_SET) != 0)
+			return 0;
 
-	if(sizeread <= 0)
+		sizeread = fread(readbuffer, 1, ZIPCHUNK, file);
+		if (sizeread < sizeof(PKZIPHEADER))
+			break; // ran out of file before finding a ROM entry
+
+		if (!IsZipFile(readbuffer))
+			break; // not a local file header - end of entries (or corrupt)
+
+		memcpy(&pkzip, readbuffer, sizeof(PKZIPHEADER));
+		pkzip.compressionMethod = FLIP16(pkzip.compressionMethod);
+		pkzip.compressedSize    = FLIP32(pkzip.compressedSize);
+		pkzip.uncompressedSize  = FLIP32(pkzip.uncompressedSize);
+		unsigned short nameLen  = FLIP16(pkzip.filenameLength);
+		unsigned short extraLen = FLIP16(pkzip.extraDataLength);
+
+		if (sizeread < sizeof(PKZIPHEADER) + nameLen)
+			break; // truncated/corrupt entry
+
+		int copyLen = (nameLen < sizeof(entryName) - 1) ? nameLen : (int)sizeof(entryName) - 1;
+		memcpy(entryName, readbuffer + sizeof(PKZIPHEADER), copyLen);
+		entryName[copyLen] = 0;
+
+		size_t dataOffset = entryOffset + sizeof(PKZIPHEADER) + nameLen + extraLen;
+
+		if (IsRomEntryName(entryName, nameLen))
+		{
+			zipoffset = dataOffset - entryOffset; // where the compressed data starts within readbuffer's window
+			break; // found it - pkzip/entryOffset/zipoffset now describe this entry
+		}
+
+		// Not a ROM - skip past this entry's data and try the next header.
+		// (Store and Deflate both lay the entry's data out compressedSize
+		// bytes long regardless of method, so this is safe either way.)
+		entryOffset = dataOffset + pkzip.compressedSize;
+		pkzip.uncompressedSize = 0; // in case the loop exits without a match
+	}
+
+	if (pkzip.uncompressedSize == 0 || pkzip.uncompressedSize > buffersize)
 		return 0;
 
-	/*** Copy PKZip header to local, used as info ***/
-	memcpy (&pkzip, readbuffer, sizeof (PKZIPHEADER));
-
-	pkzip.uncompressedSize = FLIP32 (pkzip.uncompressedSize);
-
-	if(pkzip.uncompressedSize > buffersize) {
+	if (pkzip.compressionMethod != 0 && pkzip.compressionMethod != 8)
+	{
+		ErrorPrompt("Error - unsupported ZIP compression method!");
 		return 0;
 	}
 
+	// Re-read this entry's own window (readbuffer above was left at
+	// whichever entry we broke the loop on, which is the one we want)
+	fseek(file, (long)entryOffset, SEEK_SET);
+	sizeread = fread(readbuffer, 1, ZIPCHUNK, file);
+	if (sizeread <= 0)
+		return 0;
+
 	ShowProgress ("Loading...", 0, pkzip.uncompressedSize);
 
-	/*** Prepare the zip stream ***/
+	if (pkzip.compressionMethod == 0)
+	{
+		// Store - raw copy, no inflate needed. First chunk is whatever's
+		// left in readbuffer past the header/name/extra; the rest streams
+		// straight from disk.
+		size_t avail = sizeread - zipoffset;
+		if (avail > pkzip.uncompressedSize) avail = pkzip.uncompressedSize;
+		memcpy(outbuffer, &readbuffer[zipoffset], avail);
+		bufferoffset = avail;
+
+		while (bufferoffset < pkzip.uncompressedSize)
+		{
+			size_t want = pkzip.uncompressedSize - bufferoffset;
+			if (want > ZIPCHUNK) want = ZIPCHUNK;
+			sizeread = fread(&outbuffer[bufferoffset], 1, want, file);
+			if (sizeread <= 0) break;
+			bufferoffset += sizeread;
+			ShowProgress ("Loading...", bufferoffset, pkzip.uncompressedSize);
+		}
+
+		CancelAction();
+		return (bufferoffset == pkzip.uncompressedSize) ? bufferoffset : 0;
+	}
+
+	/*** Prepare the zip stream (Deflate path - unchanged from before) ***/
 	memset (&zs, 0, sizeof (z_stream));
 	zs.zalloc = Z_NULL;
 	zs.zfree = Z_NULL;
@@ -141,9 +277,6 @@ UnZipBuffer (unsigned char *outbuffer, size_t buffersize)
 		goto done;
 
 	/*** Set ZipChunk for first pass ***/
-	zipoffset =
-	(sizeof (PKZIPHEADER) + FLIP16 (pkzip.filenameLength) +
-	FLIP16 (pkzip.extraDataLength));
 	zipchunk = ZIPCHUNK - zipoffset;
 
 	/*** Now do it! ***/
