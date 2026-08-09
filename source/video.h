@@ -22,6 +22,7 @@ void ResetVideo_Emu();
 void ResetVideo_Menu();
 void TakeScreenshot();
 void ClearScreenshot();
+void GX_ThrottleVSync(); // see video.cpp for what this is and why it exists
 void Menu_Render();
 void Menu_DrawImg(f32 xpos, f32 ypos, u16 width, u16 height, u8 data[], f32 degrees, f32 scaleX, f32 scaleY, u8 alphaF );
 void Menu_DrawImg565(f32 xpos, f32 ypos, u16 width, u16 height, u8 data[], f32 degrees, f32 scaleX, f32 scaleY, u8 alphaF );
