@@ -609,7 +609,23 @@ void StopGX()
 static GXRModeObj * FindVideoMode(bool forceAuto = false)
 {
 	GXRModeObj * mode;
-	
+
+	// Auto mode's underlying TV standard (PAL/NTSC/EURGB60/etc.) is a fixed
+	// property of the console for the whole session - real Wii/GameCube
+	// hardware never changes what VIDEO_GetPreferredMode() reports mid-run.
+	// FindVideoMode() gets called multiple times over a session though
+	// (InitializeVideo() at startup, ResetVideo_Menu() every menu entry,
+	// ResetVideo_Emu() every game boot), and re-querying
+	// VIDEO_GetPreferredMode() fresh each time turned out NOT to be a safe
+	// no-op under Dolphin specifically - its emulation of that call can
+	// return a different answer once VIDEO_Configure() has already run
+	// once (observed as the menu correctly landing on true PAL/50Hz, then
+	// gameplay drifting to NTSC/60Hz on the very next call). Caching the
+	// first resolved answer keeps every Auto resolution point consistent
+	// with each other regardless of that, and costs nothing on real
+	// hardware since the "fresh" query would always have agreed anyway.
+	static GXRModeObj *cachedAutoMode = NULL;
+
 	// choose the desired video mode
 	switch(forceAuto ? VIDEOMODE_AUTO : GCSettings.videomode)
 	{
@@ -632,7 +648,9 @@ static GXRModeObj * FindVideoMode(bool forceAuto = false)
 			mode = &TVEurgb60Hz240Ds;
 			break;
 		default:
-			mode = VIDEO_GetPreferredMode(NULL);
+			if (!cachedAutoMode)
+				cachedAutoMode = VIDEO_GetPreferredMode(NULL);
+			mode = cachedAutoMode;
 			break;
 	}
 
@@ -693,14 +711,19 @@ static void SetupVideoMode(GXRModeObj * mode)
 /****************************************************************************
  * GetCurrentTVFrameRate
  *
- * Returns the display refresh rate (in Hz) that mgba_emuMain()'s VSync loop
- * is actually pacing to right now, for the currently active `vmode` (set by
- * SetupVideoMode() just above). vbasupport.cpp's audio code
- * (InitMGBAAudio()) uses this to seed its resampler rate-correction ratio
- * with the same clockRate/(desiredFrameRate*frameCycles) formula mGBA's own
- * frontends use (mCoreCalculateFramerateRatio), instead of starting from a
- * flat 1.0 guess and drifting into place over the first few seconds of
- * audio via wall-clock measurement alone.
+ * Returns the real display refresh rate (in Hz) of the currently active
+ * `vmode` (set by SetupVideoMode() just above) - i.e. how often
+ * mgba_emuMain() (vbasupport.cpp) actually gets called, since GX_Render()'s
+ * internal VIDEO_WaitVSync() is what paces it.
+ *
+ * mgba_emuMain() divides this into the core's own native fps to figure out
+ * how many core->runFrame() calls a given vsync is actually owed, so that
+ * GBA game speed stays pinned to the GBA's real ~59.7275fps clock
+ * regardless of what the display refreshes at - on true PAL (50Hz) that
+ * means occasionally running two native frames per vsync rather than
+ * silently running the game ~16.7% slow to match the display, the same
+ * mismatch a real GBA-on-PAL-TV would show. See mgba_emuMain()'s own
+ * "Native-rate frame pacing" comment for the accumulator that does this.
  *
  * True PAL (50Hz field rate) is the only mode on real Wii hardware whose
  * refresh meaningfully differs from ~59.94Hz - NTSC, EURGB60/PAL60, and

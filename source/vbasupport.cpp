@@ -723,9 +723,12 @@ extern u8* GetMixerDataPtr();
 extern volatile int* GetMixerHeadPtr();
 extern volatile int* GetMixerTailPtr();
 
-// video.cpp - returns the real Hz mgba_emuMain()'s VSync loop is currently
-// pacing to (50.0 for true PAL, ~59.94 for everything else). See that
-// function's own comment for why only true PAL differs.
+// video.cpp - returns the real display refresh Hz that mgba_emuMain() gets
+// called at (50.0 for true PAL, ~59.94 for everything else). Used by
+// mgba_emuMain()'s own native-rate pacing accumulator to decide how many
+// core->runFrame() calls each vsync is owed, keeping GBA game speed pinned
+// to native ~59.7275fps regardless of display refresh. See that function's
+// own comment for why only true PAL differs.
 extern double GetCurrentTVFrameRate();
 
 // audio.cpp - re-primes the DMA chain if SwitchAudioMode(1) handed audio to
@@ -745,10 +748,16 @@ static unsigned lastCoreRate = 0;  // last core->audioSampleRate() seen; mAudioR
                                     // SOUNDBIAS mid-game). GB/GBC never changes this mid-game.
 
 // --- Periodic real-time recalibration ------------------------------------
-// fpsRatio (InitMGBAAudio(), below) is computed once per ROM load from
-// GetCurrentTVFrameRate()'s NOMINAL value (50.0/59.94) divided into the
-// core's native FPS. That assumes mgba_emuMain() actually achieves that
-// many real callbacks per second. In testing this doesn't hold on GB/GBC:
+// fpsRatio (InitMGBAAudio(), below) used to be computed once per ROM load
+// from GetCurrentTVFrameRate()'s NOMINAL value (50.0/59.94) divided into
+// the core's native FPS - it's now flat 1.0, since mgba_emuMain()'s own
+// native-rate pacing accumulator keeps the core running at real native
+// speed directly instead of needing audio to pitch-correct for a slower
+// core (see mgba_emuMain()'s "Native-rate frame pacing" comment). The
+// deficit this section describes is a separate, still-live issue: even at
+// the right AVERAGE rate, mgba_emuMain() achieving fewer real callbacks/sec
+// than the nominal display rate implies. In testing this doesn't hold on
+// GB/GBC:
 // per-frame video cost (color LUT application, interframe blending,
 // texture upload) plus the vsync wait in GX_Render() means the ACHIEVED
 // callback rate sits measurably below the nominal TV rate. Because the
@@ -1144,10 +1153,20 @@ static void InitMGBAAudio()
     // even though the resampler buffers themselves are reused.
     if (!core) return;
 
-    double nativeFPS = 60.0; // matches the reference's own flat fallback (fps = 60.0/1.001)
-    if (core->frequency(core) > 0 && core->frameCycles(core) > 0)
-        nativeFPS = (double)core->frequency(core) / (double)core->frameCycles(core);
-    fpsRatio = GetCurrentTVFrameRate() / nativeFPS;
+    // fpsRatio used to be GetCurrentTVFrameRate()/nativeFPS - a permanent
+    // pitch-correction factor compensating for mgba_emuMain() running
+    // core->runFrame() at the DISPLAY's refresh rate (50Hz on true PAL)
+    // instead of the GBA's real native rate. Now that mgba_emuMain() paces
+    // itself to native rate directly via its own coreFrameAccum catch-up
+    // loop (vbasupport.cpp), the core genuinely produces audio at its
+    // normal native rate in real wall-clock time on every video mode,
+    // PAL included - there's no more permanent TV-refresh/native-rate
+    // mismatch left to correct here, so this stays flat at 1.0. Ordinary
+    // host-clock jitter (imperfect vsync pacing, per-frame CPU cost) is
+    // still handled separately by the dynamic-rate DMA-occupancy correction
+    // (PushAudio()/GBC_AudioGetDynamicRate(), audio.cpp) - a different
+    // problem this variable was never meant to solve.
+    fpsRatio = 1.0;
 
     unsigned srcRate = core->audioSampleRate(core);
     if (!srcRate) srcRate = 32768;
@@ -1613,15 +1632,51 @@ static void mgba_emuMain(int count)
     if (heldFF > effectiveFF)
         effectiveFF = heldFF;
 
-    if (effectiveFF >= 1 && effectiveFF <= 3) {
-        for (int i = 0; i < effectiveFF; i++) {
-            core->runFrame(core);
-            PushAudio();
-        }
-    }
+    // --- Native-rate frame pacing ------------------------------------------
+    // This function is called once per real display vsync (GX_Render()'s own
+    // internal VIDEO_WaitVSync() is what actually paces the caller - see
+    // video.cpp). The GBA's own hardware clock is fixed at ~59.7275fps
+    // regardless of what the display refreshes at, so calling
+    // core->runFrame() exactly once per vsync silently ties game speed to
+    // the DISPLAY's refresh rate instead - fine on NTSC/EURGB60 (~59.94Hz,
+    // within 0.3% of native and imperceptible), but on a true PAL 50Hz
+    // Wii/GameCube that's a genuine ~16.7% game-logic slowdown, the same
+    // mismatch a real GBA plugged into a PAL TV would show. For an "it just
+    // works" emulator that's not the experience we want - PAL owners should
+    // get the same game speed as everyone else.
+    //
+    // Fix: accumulate real native-frames-owed against the display's actual
+    // refresh rate (GetCurrentTVFrameRate(), video.cpp) each call. On PAL
+    // this averages out to running TWO core frames on roughly 1 out of
+    // every 6 vsyncs (59.7275/50 = 1.19455) instead of exactly one on all
+    // of them - only the LAST of those frames' video actually gets drawn
+    // below (the earlier one is superseded, same tradeoff Frameskip already
+    // makes on purpose), but BOTH frames' audio is pushed so nothing is
+    // lost or duplicated. On NTSC/EURGB60 this reduces to running exactly 1
+    // frame almost every vsync, matching the old flat behavior.
+    static double coreFrameAccum = 0.0;
+    double nativeFPS = 60.0; // matches InitMGBAAudio()'s own flat fallback
+    if (core->frequency(core) > 0 && core->frameCycles(core) > 0)
+        nativeFPS = (double)core->frequency(core) / (double)core->frameCycles(core);
+    double tvHz = GetCurrentTVFrameRate();
+    coreFrameAccum += (tvHz > 0.0) ? (nativeFPS / tvHz) : 1.0;
+    int nativeFramesThisVSync = (int)coreFrameAccum;
+    coreFrameAccum -= nativeFramesThisVSync;
+    if (nativeFramesThisVSync < 1)
+        nativeFramesThisVSync = 1; // never let real game time actually stall
 
-    core->runFrame(core);
-    PushAudio();
+    // Fast-forward's speed multiplier applies on top of native-rate pacing,
+    // not instead of it - same effectiveFF+1 multiplier semantics as before
+    // (0=off/1x .. 3=4x), just now scaling whatever native-rate cadence
+    // this vsync actually calls for instead of a flat 1.
+    int totalFramesThisVSync = nativeFramesThisVSync;
+    if (effectiveFF >= 1 && effectiveFF <= 3)
+        totalFramesThisVSync *= (effectiveFF + 1);
+
+    for (int i = 0; i < totalFramesThisVSync; i++) {
+        core->runFrame(core);
+        PushAudio();
+    }
 
     // Index 0 = off (matches old on/off meaning exactly, so existing saved
     // settings.xml values of 0/1 keep working unchanged). Indices 2+ are
